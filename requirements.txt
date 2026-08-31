@@ -1,0 +1,7 @@
+streamlit>=1.32.0
+numpy>=1.26.0
+pillow>=10.0.0
+scipy>=1.11.0
+tifffile>=2024.1.0
+imagecodecs>=2024.1.0
+psdtags>=2024.1.0
