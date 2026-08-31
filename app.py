@@ -19,8 +19,7 @@ from typing import Literal
 
 import numpy as np
 import streamlit as st
-from PIL import Image
-from scipy import ndimage
+from PIL import Image, ImageFilter
 from tifffile import TiffFile, imwrite
 
 from psdtags import (
@@ -34,6 +33,8 @@ from psdtags import (
 WHITE_CHANNEL_NAME = "white"
 DEFAULT_CHOKE_PX = 2
 DEFAULT_DPI = 300
+DEFAULT_BLACK_CUTOFF = 18
+DEFAULT_BLACK_FEATHER = 28
 MAX_PREVIEW_EDGE = 640
 WHITE_NAME_ALIASES = {
     "white",
@@ -45,13 +46,13 @@ WHITE_NAME_ALIASES = {
 }
 
 ChannelPolarity = Literal["white_prints", "black_prints"]
-ChokeMode = Literal["soft", "hard"]
 
 
 @dataclass(frozen=True)
 class ProcessResult:
     rgb: np.ndarray
     alpha: np.ndarray
+    coverage: np.ndarray
     white: np.ndarray
     dpi: float
     source_name: str
@@ -82,13 +83,7 @@ class ChannelDocument:
     rgb: np.ndarray | None = None
     white: np.ndarray | None = None
     alpha: np.ndarray | None = None
-
-
-def _disk(radius: int) -> np.ndarray:
-    if radius <= 0:
-        return np.ones((1, 1), dtype=bool)
-    y, x = np.ogrid[-radius : radius + 1, -radius : radius + 1]
-    return (x * x + y * y) <= radius * radius
+    coverage: np.ndarray | None = None
 
 
 def _is_white_name(name: str) -> bool:
@@ -116,38 +111,6 @@ def load_rgba(file_bytes: bytes, filename: str) -> tuple[np.ndarray, float]:
     return rgba, dpi
 
 
-def choke_alpha(
-    alpha: np.ndarray,
-    pixels: int,
-    mode: ChokeMode = "soft",
-    threshold: int = 8,
-) -> np.ndarray:
-    alpha = alpha.astype(np.uint8, copy=False)
-    if threshold > 0:
-        alpha = np.where(alpha >= threshold, alpha, 0).astype(np.uint8)
-    if pixels <= 0:
-        return alpha
-    footprint = _disk(int(pixels))
-    if mode == "hard":
-        binary = alpha > max(threshold, 1)
-        eroded = ndimage.binary_erosion(binary, structure=footprint)
-        return np.where(eroded, 255, 0).astype(np.uint8)
-    return ndimage.grey_erosion(alpha, footprint=footprint).astype(np.uint8)
-
-
-def build_white_channel(
-    alpha: np.ndarray,
-    choke_px: int,
-    threshold: int,
-    mode: ChokeMode,
-    polarity: ChannelPolarity,
-) -> np.ndarray:
-    white = choke_alpha(alpha, choke_px, mode=mode, threshold=threshold)
-    if polarity == "black_prints":
-        return (255 - white).astype(np.uint8)
-    return white
-
-
 def flatten_rgb(rgba: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     rgb = rgba[..., :3].copy()
     alpha = rgba[..., 3].copy()
@@ -155,21 +118,73 @@ def flatten_rgb(rgba: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return rgb, alpha
 
 
+def _smoothstep(value: np.ndarray, low: float, high: float) -> np.ndarray:
+    span = max(high - low, 1.0)
+    t = np.clip((value - low) / span, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def ink_coverage(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    black_cutoff: int = DEFAULT_BLACK_CUTOFF,
+    black_feather: int = DEFAULT_BLACK_FEATHER,
+) -> np.ndarray:
+    """Grayscale 0–255 white-ink amount. Keeps distressed holes; skips near-black."""
+    a = alpha.astype(np.float32) / 255.0
+    peak = rgb.max(axis=2).astype(np.float32)
+    color = _smoothstep(peak, float(black_cutoff), float(black_cutoff + black_feather))
+    return np.clip(a * color * 255.0, 0, 255).astype(np.uint8)
+
+
+def choke_grayscale(mask: np.ndarray, pixels: int) -> np.ndarray:
+    """Shrink bright areas by N pixels. Keeps 0–255; never binarizes."""
+    mask = mask.astype(np.uint8, copy=False)
+    if pixels <= 0:
+        return mask
+    size = 2 * int(pixels) + 1
+    try:
+        import cv2
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+        return cv2.erode(mask, kernel, iterations=1)
+    except Exception:
+        return np.array(Image.fromarray(mask).filter(ImageFilter.MinFilter(size)))
+
+
+def build_white_channel(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    choke_px: int,
+    black_cutoff: int,
+    black_feather: int,
+    polarity: ChannelPolarity,
+) -> tuple[np.ndarray, np.ndarray]:
+    coverage = ink_coverage(rgb, alpha, black_cutoff, black_feather)
+    white = choke_grayscale(coverage, choke_px)
+    if polarity == "black_prints":
+        white = (255 - white).astype(np.uint8)
+    return coverage, white
+
+
 def process_artwork(
     file_bytes: bytes,
     filename: str,
     choke_px: int,
-    threshold: int,
-    choke_mode: ChokeMode,
+    black_cutoff: int,
+    black_feather: int,
     polarity: ChannelPolarity,
     dpi_override: float | None = None,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
-    white = build_white_channel(alpha, choke_px, threshold, choke_mode, polarity)
+    coverage, white = build_white_channel(
+        rgb, alpha, choke_px, black_cutoff, black_feather, polarity
+    )
     return ProcessResult(
         rgb=rgb,
         alpha=alpha,
+        coverage=coverage,
         white=white,
         dpi=float(dpi_override or dpi),
         source_name=filename,
@@ -211,7 +226,7 @@ def write_tiff_with_white(
     buf = io.BytesIO()
     options = dict(
         photometric="rgb",
-        extrasamples="unspecified",
+        extrasamples=0,
         planarconfig="contig",
         metadata=None,
         resolution=(float(dpi), float(dpi)),
@@ -413,26 +428,34 @@ def extra_channel_names_from_page(page) -> list[str]:
     return unicode_names or pascal
 
 
+def _ps_composite(rgb: np.ndarray, alpha: np.ndarray | None) -> np.ndarray:
+    """Photoshop-style RGB thumbnail on black, not a white page."""
+    if alpha is None:
+        return rgb
+    a = (alpha.astype(np.float32) / 255.0)[..., None]
+    return (rgb.astype(np.float32) * a).astype(np.uint8)
+
+
 def _color_channel_views(rgb: np.ndarray) -> list[ChannelView]:
     return [
-        ChannelView("RGB", rgb, shortcut="⌘2", subtitle="合成"),
-        ChannelView("紅", rgb[:, :, 0], shortcut="⌘3", subtitle="Red"),
-        ChannelView("綠", rgb[:, :, 1], shortcut="⌘4", subtitle="Green"),
-        ChannelView("藍", rgb[:, :, 2], shortcut="⌘5", subtitle="Blue"),
+        ChannelView("RGB", rgb, shortcut="Ctrl+2", subtitle="合成"),
+        ChannelView("红", rgb[:, :, 0], shortcut="Ctrl+3", subtitle="Red"),
+        ChannelView("绿", rgb[:, :, 1], shortcut="Ctrl+4", subtitle="Green"),
+        ChannelView("蓝", rgb[:, :, 2], shortcut="Ctrl+5", subtitle="Blue"),
     ]
 
 
 def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDocument:
-    rgb_view = composite_rgba_preview(result.rgb, result.alpha)
+    rgb_view = _ps_composite(result.rgb, result.alpha)
     channels = _color_channel_views(rgb_view)
     channels.append(
         ChannelView(
             name=channel_name,
             image=result.white,
-            shortcut="⌘6",
+            shortcut="Ctrl+6",
             is_white=True,
             is_new=True,
-            subtitle="白墨 Extra / Spot",
+            subtitle="白墨專色 / Spot",
         )
     )
     return ChannelDocument(
@@ -445,10 +468,11 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         status="generated",
         channels=channels,
         extra_names=[channel_name],
-        note="已新增第 5 通道 white，可下載 TIFF 給 RIP。",
+        note="第 5 通道 white 已寫入。灰階 = 白墨量，磨損處不會鋪死白。",
         rgb=result.rgb,
         white=result.white,
         alpha=result.alpha,
+        coverage=result.coverage,
     )
 
 
@@ -488,7 +512,7 @@ def _inspect_tiff(file_bytes: bytes, filename: str) -> ChannelDocument:
 
     height, width, samples = data.shape[0], data.shape[1], data.shape[2]
     rgb = data[:, :, :3] if samples >= 3 else np.repeat(data[:, :, :1], 3, axis=2)
-    channels = _color_channel_views(rgb)
+    channels = _color_channel_views(_ps_composite(rgb, None))
 
     found_white = False
     resolved_extras: list[str] = []
@@ -566,14 +590,17 @@ def _b64_preview(arr: np.ndarray, max_edge: int = 420) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def render_channel_panel(doc: ChannelDocument | None) -> None:
+def render_channel_panel(
+    doc: ChannelDocument | None,
+    preview_choice: str = "RGB",
+) -> None:
     if doc is None:
         st.markdown(
             """
             <div class="empty-channels">
               <div class="empty-mark"></div>
               <div class="empty-title">通道</div>
-              <div class="empty-copy">製作完成後，這裡會出現 RGB 與第 5 通道 white。<br>也可拖入既有 TIFF，確認是否已經有白墨通道。</div>
+              <div class="empty-copy">製作完成後，這裡會出現與 Photoshop 相同的通道：<br>RGB、红、绿、蓝、white。</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -587,19 +614,38 @@ def render_channel_panel(doc: ChannelDocument | None) -> None:
     else:
         tone, label = "warn", "沒有 white 通道"
 
+    preview_map = {ch.name: ch.image for ch in doc.channels}
+    if doc.coverage is not None:
+        preview_map["原始 Alpha"] = doc.coverage
+    elif doc.alpha is not None:
+        preview_map["原始 Alpha"] = doc.alpha
+    if doc.white is not None:
+        preview_map["內縮後白墨"] = doc.white
+
+    preview_src = preview_map.get(preview_choice)
+    if preview_src is None:
+        preview_src = doc.channels[0].image if doc.channels else np.zeros((8, 8, 3), np.uint8)
+
     rows = []
     for ch in doc.channels:
         badge = ""
         row_class = "ch-row"
-        if ch.is_white and ch.is_new:
+        if ch.name == preview_choice or (
+            preview_choice in {"內縮後白墨", "white"} and ch.is_white
+        ):
+            row_class += " ch-active"
+        if ch.is_white:
             row_class += " ch-white"
-            badge = '<span class="badge badge-new">新增</span>'
-        elif ch.is_white:
-            row_class += " ch-white"
-            badge = '<span class="badge badge-ok">已有</span>'
+            badge = (
+                '<span class="badge badge-new">新增</span>'
+                if ch.is_new
+                else '<span class="badge badge-ok">已有</span>'
+            )
+        eye = "eye-on" if ch.name == "RGB" else "eye-off"
         rows.append(
             f"""
             <div class="{row_class}">
+              <span class="eye {eye}"></span>
               <img alt="" src="data:image/png;base64,{_b64_thumb(ch.image)}" />
               <div class="ch-meta">
                 <div class="ch-name">{html.escape(ch.name)}</div>
@@ -611,15 +657,15 @@ def render_channel_panel(doc: ChannelDocument | None) -> None:
             """
         )
 
-    preview_src = doc.channels[0].image if doc.channels else np.zeros((8, 8, 3), np.uint8)
     st.markdown(
         f"""
         <div class="status-pill {tone}">{html.escape(label)}</div>
         <div class="panel-kicker">{html.escape(doc.filename)} · {doc.width} × {doc.height} · {doc.dpi:.0f} dpi · {doc.sample_count} samples</div>
         <div class="note">{html.escape(doc.note)}</div>
-        <div class="preview-frame">
+        <div class="preview-frame preview-dark">
           <img alt="preview" src="data:image/png;base64,{_b64_preview(preview_src)}" />
         </div>
+        <div class="ps-label">通道</div>
         <div class="ch-panel">{''.join(rows)}</div>
         """,
         unsafe_allow_html=True,
@@ -758,7 +804,23 @@ def _inject_styles() -> None:
           align-items: center;
           min-height: 180px;
         }
-        .preview-frame img { width: 100%; display: block; }
+        .preview-frame.preview-dark { background: #111; }
+        .ps-label {
+          font-size: 12px;
+          font-weight: 600;
+          color: #86868b;
+          margin: 4px 10px 6px;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        }
+        .ch-row.ch-active { outline: 1px solid #0071e3; background: #eef5ff; }
+        .eye {
+          width: 14px; height: 14px;
+          border-radius: 50%;
+          flex: 0 0 14px;
+        }
+        .eye-on { background: #1d1d1f; }
+        .eye-off { background: transparent; border: 1px solid #d2d2d7; }
         .ch-panel { margin: 0 4px 8px; }
         .ch-row {
           display: flex;
@@ -843,7 +905,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>上傳透明 PNG，產生含 white 通道的 TIFF。電腦與手機都可接著做；也可打開舊檔，確認是否已有白墨通道。</p>
+          <p>上傳透明 PNG，產生含 white 專色通道的 TIFF。右側通道面板與 Photoshop 相同，可對比內縮前後的白墨。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -854,7 +916,7 @@ def render_app() -> None:
     with left:
         st.markdown(
             '<div class="panel-title">輸入</div>'
-            '<div class="panel-copy">點選上傳，從檔案或「檔案 App」選透明 PNG。白墨由 Alpha 自動生成並收邊。</div>',
+            '<div class="panel-copy">點選上傳透明 PNG。白墨為灰階（保留做舊），並向內縮一圈避免露白。</div>',
             unsafe_allow_html=True,
         )
         source = st.file_uploader(
@@ -865,15 +927,22 @@ def render_app() -> None:
             label_visibility="collapsed",
         )
 
-        choke_px = st.slider("白墨收邊", min_value=0, max_value=12, value=DEFAULT_CHOKE_PX)
+        choke_px = st.slider(
+            "白墨內縮像素 (Choke Limit)",
+            min_value=0,
+            max_value=10,
+            value=DEFAULT_CHOKE_PX,
+            help="白墨比彩圖小一圈。0 仍可能露白，建議 2。",
+        )
         with st.expander("進階"):
-            threshold = st.slider("Alpha 門檻", 0, 128, 8)
-            choke_mode = st.radio(
-                "收邊",
-                ["soft", "hard"],
-                format_func=lambda x: "柔邊" if x == "soft" else "硬邊",
-                horizontal=True,
+            black_cutoff = st.slider(
+                "黑色不鋪白（保留做舊）",
+                0,
+                60,
+                DEFAULT_BLACK_CUTOFF,
+                help="夠黑的像素不噴白墨，磨損細點才不會變死白。",
             )
+            black_feather = st.slider("黑色過渡", 4, 80, DEFAULT_BLACK_FEATHER)
             polarity = st.radio(
                 "極性",
                 ["white_prints", "black_prints"],
@@ -901,8 +970,8 @@ def render_app() -> None:
                     file_bytes=source.getvalue(),
                     filename=source.name,
                     choke_px=int(choke_px),
-                    threshold=int(threshold),
-                    choke_mode=choke_mode,  # type: ignore[arg-type]
+                    black_cutoff=int(black_cutoff),
+                    black_feather=int(black_feather),
                     polarity=polarity,  # type: ignore[arg-type]
                     dpi_override=float(dpi_override),
                 )
@@ -914,16 +983,32 @@ def render_app() -> None:
                     channel_name=channel_name,
                     compression=compression,
                 )
-                stem = source.name.rsplit(".", 1)[0]
-                st.download_button(
-                    "下載 TIFF",
-                    data=tiff_bytes,
-                    file_name=f"{stem}_{channel_name}.tif",
-                    mime="image/tiff",
-                    type="primary",
-                    use_container_width=True,
+                psd_bytes = write_psd_with_white(
+                    result.rgb,
+                    result.white,
+                    result.dpi,
+                    channel_name=channel_name,
                 )
-                st.caption("無損 TIFF · RGB + white 專色通道 · 給 DTG RIP 直接輸出")
+                stem = source.name.rsplit(".", 1)[0]
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.download_button(
+                        "下載 TIFF",
+                        data=tiff_bytes,
+                        file_name=f"{stem}_{channel_name}.tif",
+                        mime="image/tiff",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with d2:
+                    st.download_button(
+                        "下載 PSD",
+                        data=psd_bytes,
+                        file_name=f"{stem}_{channel_name}.psd",
+                        mime="image/vnd.adobe.photoshop",
+                        use_container_width=True,
+                    )
+                st.caption("300 DPI · RGB + white 專色 · 灰階白墨 · ExtraSamples 不當作透明度")
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
 
@@ -951,10 +1036,17 @@ def render_app() -> None:
     with right:
         st.markdown(
             '<div class="panel-title">通道</div>'
-            '<div class="panel-copy">與 Photoshop 通道面板相同：RGB、紅、綠、藍，以及第 5 通道 white。</div>',
+            '<div class="panel-copy">與 Photoshop 通道面板相同：RGB、红、绿、蓝、white。可切換原始 Alpha 與內縮後白墨。</div>',
             unsafe_allow_html=True,
         )
-        render_channel_panel(inspect_doc or generated_doc)
+        preview_choice = st.radio(
+            "白墨遮罩對比預覽",
+            options=["RGB", "white", "原始 Alpha", "內縮後白墨"],
+            index=0,
+            horizontal=True,
+            help="原始 Alpha = 未內縮的灰階覆蓋；內縮後白墨 = 實際寫入 TIFF 的 white 通道。",
+        )
+        render_channel_panel(inspect_doc or generated_doc, preview_choice)
 
 
 if __name__ == "__main__":
