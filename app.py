@@ -1,8 +1,8 @@
 """ON99 DTG / DTF 白墨通道生成工具。
 
-從透明 PNG 自動產生 PrintEXP / Maintop 可匯入的 TIFF：
-RGB 合成色 + 名為 W1 的 Photoshop New Spot Channel（完整白墨底圖）。
-右側通道面板可預覽產出，也可拖入既有 TIFF 檢查是否已有 W1。
+從透明 PNG 自動產生 Hoson PrintEXP 可 Import 的 TIFF：
+RGB + Photoshop Spot Color Channel（預設名 white，完整白墨底圖）。
+右側通道面板可預覽產出，也可檢查既有 TIFF 是否已有 white Spot。
 
 啟動：
     pip install -r requirements.txt
@@ -16,7 +16,6 @@ import html
 import io
 import struct
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Literal
 
 import numpy as np
@@ -25,16 +24,18 @@ from PIL import Image, ImageFilter
 from tifffile import TiffFile, imwrite
 
 from psdtags import (
-    PsdBytesBlock,
-    PsdFormat,
-    PsdPascalStringsBlock,
     PsdResourceId,
-    PsdStringsBlock,
-    PsdVersionBlock,
     TiffImageResources,
 )
 
-WHITE_CHANNEL_NAME = "W1"
+from tiff_export import (
+    DEFAULT_SPOT_NAME,
+    ExportMode,
+    inspect_spot_metadata,
+    write_tiff_with_spot,
+)
+
+WHITE_CHANNEL_NAME = "white"
 DEFAULT_CHOKE_PX = 2
 DEFAULT_DPI = 300
 DEFAULT_BLACK_CUTOFF = 18
@@ -250,87 +251,6 @@ def cmyk_to_rgb_preview(cmyk: np.ndarray) -> np.ndarray:
     return np.clip(np.stack([r, g, b], axis=-1), 0, 255).astype(np.uint8)
 
 
-def _spot_display_info(count: int) -> bytes:
-    """Photoshop DisplayInfo (1077): kind=2 marks each extra channel as Spot."""
-    parts = [struct.pack(">I", 1)]
-    for _ in range(count):
-        # HSB overlay similar to Photoshop default spot preview.
-        parts.append(struct.pack(">h4HHb", 1, 0, 65535, 65535, 0, 0, 2))
-    return b"".join(parts)
-
-
-def _alternate_spot_colors(count: int, start_id: int = 3) -> bytes:
-    """Photoshop Alternate Spot Colors (1067) with Lab placeholders."""
-    parts = [struct.pack(">HH", 1, count)]
-    for index in range(count):
-        channel_id = start_id + index
-        # Lab values copied from a Photoshop-saved W1 spot TIFF.
-        parts.append(struct.pack(">Ih4H", channel_id, 7, 0x1535, 0x1F90, 0x1B4E, 0))
-    return b"".join(parts)
-
-
-def _resolution_info_bytes(dpi: float) -> bytes:
-    fixed = int(round(float(dpi) * 65536.0)) & 0xFFFFFFFF
-    return struct.pack(">IHH IHH", fixed, 1, 1, fixed, 1, 1)
-
-
-def _srgb_icc_profile() -> bytes | None:
-    try:
-        from PIL import ImageCms
-
-        return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
-    except Exception:
-        return None
-
-
-def _photoshop_spot_tags(channel_names: list[str], dpi: float = DEFAULT_DPI) -> tuple:
-    """Photoshop ImageResources so PrintEXP treats extras as named New Spot channels."""
-    if not channel_names:
-        raise ValueError("至少需要一個專色通道名稱")
-    count = len(channel_names)
-    start_id = 3
-    alpha_ids = b"".join(struct.pack(">I", start_id + i) for i in range(count))
-    resources = TiffImageResources(
-        name=f"{channel_names[0]}.tif",
-        psdformat=PsdFormat.BE32BIT,
-        blocks=[
-            PsdBytesBlock(
-                resourceid=PsdResourceId.RESOLUTION_INFO,
-                value=_resolution_info_bytes(dpi),
-            ),
-            PsdPascalStringsBlock(
-                resourceid=PsdResourceId.ALPHA_NAMES_PASCAL,
-                values=channel_names,
-            ),
-            PsdStringsBlock(
-                resourceid=PsdResourceId.ALPHA_NAMES_UNICODE,
-                values=channel_names,
-            ),
-            PsdBytesBlock(
-                resourceid=PsdResourceId.DISPLAY_INFO,
-                value=_spot_display_info(count),
-            ),
-            PsdBytesBlock(
-                resourceid=PsdResourceId.ALPHA_IDENTIFIERS,
-                value=alpha_ids,
-            ),
-            PsdBytesBlock(
-                resourceid=PsdResourceId.ALTERNATE_SPOT_COLORS,
-                value=_alternate_spot_colors(count, start_id=start_id),
-            ),
-            PsdVersionBlock(
-                resourceid=PsdResourceId.VERSION_INFO,
-                version=1,
-                file_version=1,
-                writer_name="Adobe Photoshop",
-                reader_name="Adobe Photoshop",
-                has_real_merged_data=True,
-            ),
-        ],
-    )
-    return resources.tifftag()
-
-
 def write_tiff_with_white(
     rgb: np.ndarray,
     white: np.ndarray,
@@ -339,42 +259,27 @@ def write_tiff_with_white(
     compression: str = "none",
     alpha: np.ndarray | None = None,
     include_w2: bool = False,
+    export_mode: ExportMode = "printexp_spot",
+    varnish_name: str = "varnish",
 ) -> bytes:
-    """Lossless RGB TIFF + New Spot Channel(s) for PrintEXP / Maintop import."""
-    del alpha  # RGB composite is flattened already; spot is the white underbase.
-    if rgb.ndim != 3 or rgb.shape[2] != 3:
-        raise ValueError("rgb 必須是 HxWx3")
-    if white.shape != rgb.shape[:2]:
-        raise ValueError("white 通道尺寸必須與 RGB 相同")
-
-    channel_names = [channel_name]
-    planes = [rgb, white[..., None]]
+    """Delegate to tiff_export — PrintEXP Spot (default) or Legacy ExtraSamples."""
+    del alpha
+    varnish = white.copy() if include_w2 else None
     if include_w2:
-        # DTF adhesive / optional second spot — same solid underbase as W1.
-        channel_names.append("W2")
-        planes.append(white[..., None])
-
-    stacked = np.concatenate(planes, axis=2).astype(np.uint8, copy=False)
-    extras = tuple(0 for _ in channel_names)
-    buf = io.BytesIO()
-    options = dict(
-        photometric="rgb",
-        extrasamples=extras,
-        planarconfig="contig",
-        metadata=False,
-        resolution=(float(dpi), float(dpi)),
-        resolutionunit="inch",
-        software="Adobe Photoshop 25.0 (Windows)",
-        datetime=datetime.now().strftime("%Y:%m:%d %H:%M:%S"),
-        extratags=[_photoshop_spot_tags(channel_names, dpi=dpi)],
+        # Maintop-style second plate keeps W2; PrintEXP factory uses varnish.
+        second = "W2" if channel_name in {"W1", "W2"} else varnish_name
+    else:
+        second = varnish_name
+    return write_tiff_with_spot(
+        rgb,
+        white,
+        dpi,
+        mode=export_mode,
+        channel_name=channel_name,
+        varnish=varnish,
+        varnish_name=second,
+        compression=compression,
     )
-    icc = _srgb_icc_profile()
-    if icc:
-        options["iccprofile"] = icc
-    if compression == "zip":
-        options["compression"] = "adobe_deflate"
-    imwrite(buf, stacked, **options)
-    return buf.getvalue()
 
 
 def _pascal_string(text: str, pad: int = 2) -> bytes:
@@ -620,7 +525,7 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         status="generated",
         channels=channels,
         extra_names=[channel_name],
-        note=f"已寫入 RGB + New Spot「{channel_name}」。W1 = 完整白墨底圖（整塊設計鋪白）。",
+        note=f"已寫入 RGB + Photoshop Spot「{channel_name}」。完整白墨底圖（整塊設計鋪白）。",
         rgb=result.rgb,
         white=result.white,
         alpha=result.alpha,
@@ -792,7 +697,7 @@ def render_channel_panel(
     for ch in doc.channels:
         badge = ""
         row_class = "ch-row"
-        white_previews = {"內縮後白墨", "white", "W1"}
+        white_previews = {"內縮後白墨", "white", "W1", "W2", "varnish"}
         if ch.name == preview_choice or (preview_choice in white_previews and ch.is_white):
             row_class += " ch-active"
         if ch.is_white:
@@ -1066,7 +971,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>上傳透明 PNG，輸出 RGB + W1 New Spot Channel（完整白墨底圖）TIFF，給 PrintEXP 匯入。</p>
+          <p>上傳透明 PNG，輸出 RGB + Photoshop Spot「white」（完整白墨底）TIFF，給 PrintEXP Spot 模式 Import。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1077,7 +982,7 @@ def render_app() -> None:
     with left:
         st.markdown(
             '<div class="panel-title">輸入</div>'
-            '<div class="panel-copy">點選上傳透明 PNG。W1 為整塊設計的完整白墨底，並向內縮一圈避免露白。</div>',
+            '<div class="panel-copy">點選上傳透明 PNG。Spot「white」為整塊設計完整白墨底，並向內縮避免露白。</div>',
             unsafe_allow_html=True,
         )
         source = st.file_uploader(
@@ -1115,16 +1020,26 @@ def render_app() -> None:
                 format_func=lambda x: "白 = 噴白墨" if x == "white_prints" else "黑 = 噴白墨",
                 horizontal=True,
             )
+            export_mode = st.radio(
+                "匯出相容模式",
+                ["printexp_spot", "legacy_extrasamples"],
+                format_func=lambda x: (
+                    "PrintExp Spot（預設，Photoshop Spot Color）"
+                    if x == "printexp_spot"
+                    else "Legacy ExtraSamples（舊輸出，僅對照）"
+                ),
+                help="PrintExp Spot 會寫 DisplayInfo kind=2 + Alternate Spot Colors。Legacy 只有 ALPHA_NAMES，PrintExp 會 Invalid。",
+            )
             channel_name = st.selectbox(
-                "專色通道名稱（PrintEXP 必須為 W1）",
-                ["W1", "W2", "white", "White"],
+                "Spot 通道名稱（廠方影片 = white）",
+                ["white", "W1", "W2", "White"],
                 index=0,
-                help="PrintEXP / Maintop Spot 模式認 W1 為白墨。",
+                help="Hoson PrintExp 廠方流程用 white；Maintop 常用 W1。",
             )
             include_w2 = st.checkbox(
-                "同時輸出 W2（DTF 膠層，複製 W1）",
+                "同時輸出第二 Spot（varnish / W2）",
                 value=False,
-                help="有啲 DTF / Maintop 流程要 W1+W2。UV PrintEXP 光油通常可唔加，Channel 2 設 None。",
+                help="PrintExp 光油可選 varnish；Maintop DTF 膠層常用 W2。",
             )
             dpi_override = st.number_input("DPI", min_value=72, max_value=600, value=DEFAULT_DPI)
             compression = st.radio(
@@ -1157,6 +1072,7 @@ def render_app() -> None:
                     compression=compression,
                     alpha=result.alpha,
                     include_w2=bool(include_w2),
+                    export_mode=export_mode,  # type: ignore[arg-type]
                 )
                 psd_bytes = write_psd_with_white(
                     result.rgb,
@@ -1184,12 +1100,14 @@ def render_app() -> None:
                         mime="image/vnd.adobe.photoshop",
                         use_container_width=True,
                     )
+                meta = inspect_spot_metadata(tiff_bytes)
                 st.caption(
-                    "RGB + New Spot(W1) · 完整白墨底 · Photoshop TIFF 結構 · PrintEXP 請用 Spot 模式匯入"
+                    f"RGB + Spot「{channel_name}」· mode={export_mode} · "
+                    f"photoshop_spot={meta['is_photoshop_spot']} · kinds={meta['spot_kinds']}"
                 )
                 st.info(
-                    "PrintEXP：匯入 TIFF → Spot channel → Data Source Type 選 **Spot** → Channel 1 = 白墨。"
-                    "若仍然打唔開檔，試勾「同時輸出 W2」，或話我知報錯內容。"
+                    "PrintExp：Import TIFF → white Color → Data Source Type = **Spot**。"
+                    "Photoshop 打開應喺 Channels 見到 Spot「white」（唔係 Alpha）。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
@@ -1223,7 +1141,7 @@ def render_app() -> None:
         )
         preview_choice = st.radio(
             "白墨遮罩對比預覽",
-            options=["RGB", "W1", "原始 Alpha", "內縮後白墨"],
+            options=["RGB", "white", "原始 Alpha", "內縮後白墨"],
             index=1,
             horizontal=True,
             help="W1 / 內縮後白墨 = 完整白墨底圖；應覆蓋整塊設計，不是局部做舊。",
