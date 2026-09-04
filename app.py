@@ -1,7 +1,7 @@
 """ON99 DTG / DTF 白墨通道生成工具。
 
 從透明 PNG 自動產生 PrintEXP / Maintop 可匯入的 TIFF：
-CMYK 合成色 + 名為 W1 的 Photoshop Spot 專色通道（白墨）。
+RGB 合成色 + 名為 W1 的 Photoshop New Spot Channel（完整白墨底圖）。
 右側通道面板可預覽產出，也可拖入既有 TIFF 檢查是否已有 W1。
 
 啟動：
@@ -128,13 +128,22 @@ def _smoothstep(value: np.ndarray, low: float, high: float) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
+def solid_underbase(alpha: np.ndarray) -> np.ndarray:
+    """Complete white underbase for the whole design (Photoshop New Spot Channel).
+
+    Uses opacity only — every visible pixel gets full white ink, including black
+    artwork. Distressed RGB holes no longer punch gaps in the spot channel.
+    """
+    return np.where(alpha > 0, np.uint8(255), np.uint8(0))
+
+
 def ink_coverage(
     rgb: np.ndarray,
     alpha: np.ndarray,
     black_cutoff: int = DEFAULT_BLACK_CUTOFF,
     black_feather: int = DEFAULT_BLACK_FEATHER,
 ) -> np.ndarray:
-    """Grayscale 0–255 white-ink amount. Keeps distressed holes; skips near-black."""
+    """Optional vintage mode: skip near-black so distressed holes stay empty."""
     a = alpha.astype(np.float32) / 255.0
     peak = rgb.max(axis=2).astype(np.float32)
     color = _smoothstep(peak, float(black_cutoff), float(black_cutoff + black_feather))
@@ -163,8 +172,12 @@ def build_white_channel(
     black_cutoff: int,
     black_feather: int,
     polarity: ChannelPolarity,
+    solid: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    coverage = ink_coverage(rgb, alpha, black_cutoff, black_feather)
+    if solid:
+        coverage = solid_underbase(alpha)
+    else:
+        coverage = ink_coverage(rgb, alpha, black_cutoff, black_feather)
     white = choke_grayscale(coverage, choke_px)
     if polarity == "black_prints":
         white = (255 - white).astype(np.uint8)
@@ -179,11 +192,12 @@ def process_artwork(
     black_feather: int,
     polarity: ChannelPolarity,
     dpi_override: float | None = None,
+    solid: bool = True,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
     coverage, white = build_white_channel(
-        rgb, alpha, choke_px, black_cutoff, black_feather, polarity
+        rgb, alpha, choke_px, black_cutoff, black_feather, polarity, solid=solid
     )
     return ProcessResult(
         rgb=rgb,
@@ -297,21 +311,17 @@ def write_tiff_with_white(
     compression: str = "none",
     alpha: np.ndarray | None = None,
 ) -> bytes:
-    """Lossless CMYK TIFF + Spot channel (default W1) for PrintEXP / Maintop."""
+    """Lossless RGB TIFF + New Spot Channel (default W1) for PrintEXP / Maintop."""
+    del alpha  # RGB composite is flattened already; spot is the white underbase.
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("rgb 必須是 HxWx3")
     if white.shape != rgb.shape[:2]:
         raise ValueError("white 通道尺寸必須與 RGB 相同")
-    if alpha is None:
-        alpha = np.full(white.shape, 255, dtype=np.uint8)
-    elif alpha.shape != white.shape:
-        raise ValueError("alpha 尺寸必須與 white 相同")
 
-    cmyk = rgb_alpha_to_cmyk(rgb, alpha)
-    stacked = np.concatenate([cmyk, white[..., None]], axis=2).astype(np.uint8)
+    stacked = np.concatenate([rgb, white[..., None]], axis=2).astype(np.uint8)
     buf = io.BytesIO()
     options = dict(
-        photometric="separated",
+        photometric="rgb",
         extrasamples=[0],
         planarconfig="contig",
         metadata=None,
@@ -362,21 +372,19 @@ def write_psd_with_white(
     channel_name: str = WHITE_CHANNEL_NAME,
     alpha: np.ndarray | None = None,
 ) -> bytes:
-    """CMYK + named spot channel PSD (PrintEXP-compatible channel layout)."""
+    """RGB + named New Spot Channel PSD (PrintEXP-compatible channel layout)."""
+    del alpha
     height, width = white.shape
-    if alpha is None:
-        alpha = np.full(white.shape, 255, dtype=np.uint8)
-    cmyk = rgb_alpha_to_cmyk(rgb, alpha)
     header = b"".join(
         [
             b"8BPS",
             struct.pack(">H", 1),
             b"\x00" * 6,
-            struct.pack(">H", 5),  # CMYK + spot
+            struct.pack(">H", 4),  # RGB + spot
             struct.pack(">I", height),
             struct.pack(">I", width),
             struct.pack(">H", 8),
-            struct.pack(">H", 4),  # CMYK mode
+            struct.pack(">H", 3),  # RGB mode
         ]
     )
     alpha_names = _pascal_string(channel_name, pad=1)
@@ -391,10 +399,9 @@ def write_psd_with_white(
     image_data = b"".join(
         [
             struct.pack(">H", 0),
-            cmyk[:, :, 0].tobytes(),
-            cmyk[:, :, 1].tobytes(),
-            cmyk[:, :, 2].tobytes(),
-            cmyk[:, :, 3].tobytes(),
+            rgb[:, :, 0].tobytes(),
+            rgb[:, :, 1].tobytes(),
+            rgb[:, :, 2].tobytes(),
             white.tobytes(),
         ]
     )
@@ -549,16 +556,16 @@ def _cmyk_channel_views(cmyk: np.ndarray) -> list[ChannelView]:
 
 
 def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDocument:
-    cmyk = rgb_alpha_to_cmyk(result.rgb, result.alpha)
-    channels = _cmyk_channel_views(cmyk)
+    rgb_view = _ps_composite(result.rgb, result.alpha)
+    channels = _color_channel_views(rgb_view)
     channels.append(
         ChannelView(
             name=channel_name,
             image=result.white,
-            shortcut="Ctrl+7",
+            shortcut="Ctrl+6",
             is_white=True,
             is_new=True,
-            subtitle="白墨專色 Spot / PrintEXP",
+            subtitle="New Spot Channel / 完整白墨底",
         )
     )
     return ChannelDocument(
@@ -566,12 +573,12 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         width=int(result.white.shape[1]),
         height=int(result.white.shape[0]),
         dpi=result.dpi,
-        sample_count=5,
+        sample_count=4,
         has_white=True,
         status="generated",
         channels=channels,
         extra_names=[channel_name],
-        note=f"已寫入 CMYK + Spot「{channel_name}」（PrintEXP / Maintop 格式）。灰階 = 白墨量。",
+        note=f"已寫入 RGB + New Spot「{channel_name}」。W1 = 完整白墨底圖（整塊設計鋪白）。",
         rgb=result.rgb,
         white=result.white,
         alpha=result.alpha,
@@ -713,7 +720,7 @@ def render_channel_panel(
             <div class="empty-channels">
               <div class="empty-mark"></div>
               <div class="empty-title">通道</div>
-              <div class="empty-copy">製作完成後，這裡會出現與 Photoshop / PrintEXP 相同的通道：<br>CMYK + W1 白墨專色。</div>
+              <div class="empty-copy">製作完成後，這裡會出現與 Photoshop 相同的通道：<br>RGB + W1 New Spot（完整白墨底圖）。</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -753,7 +760,7 @@ def render_channel_panel(
                 if ch.is_new
                 else '<span class="badge badge-ok">已有</span>'
             )
-        eye = "eye-on" if ch.name in {"RGB", "CMYK"} else "eye-off"
+        eye = "eye-on" if ch.name == "RGB" or ch.is_white else "eye-off"
         rows.append(
             f"""
             <div class="{row_class}">
@@ -1017,7 +1024,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>上傳透明 PNG，輸出 PrintEXP / Maintop 可匯入的 CMYK + W1 專色 TIFF。右側可對比內縮前後的白墨。</p>
+          <p>上傳透明 PNG，輸出 RGB + W1 New Spot Channel（完整白墨底圖）TIFF，給 PrintEXP 匯入。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1028,7 +1035,7 @@ def render_app() -> None:
     with left:
         st.markdown(
             '<div class="panel-title">輸入</div>'
-            '<div class="panel-copy">點選上傳透明 PNG。白墨為灰階（保留做舊），並向內縮一圈避免露白。</div>',
+            '<div class="panel-copy">點選上傳透明 PNG。W1 為整塊設計的完整白墨底，並向內縮一圈避免露白。</div>',
             unsafe_allow_html=True,
         )
         source = st.file_uploader(
@@ -1047,12 +1054,17 @@ def render_app() -> None:
             help="白墨比彩圖小一圈。0 仍可能露白，建議 2。",
         )
         with st.expander("進階"):
+            solid = st.checkbox(
+                "完整白墨底圖（建議開）",
+                value=True,
+                help="開：整塊設計都鋪白（影片 New Spot 做法）。關：做舊模式，黑位不鋪白。",
+            )
             black_cutoff = st.slider(
-                "黑色不鋪白（保留做舊）",
+                "黑色不鋪白（僅做舊模式）",
                 0,
                 60,
                 DEFAULT_BLACK_CUTOFF,
-                help="夠黑的像素不噴白墨，磨損細點才不會變死白。",
+                help="只在關閉「完整白墨底圖」時生效。",
             )
             black_feather = st.slider("黑色過渡", 4, 80, DEFAULT_BLACK_FEATHER)
             polarity = st.radio(
@@ -1087,6 +1099,7 @@ def render_app() -> None:
                     black_feather=int(black_feather),
                     polarity=polarity,  # type: ignore[arg-type]
                     dpi_override=float(dpi_override),
+                    solid=bool(solid),
                 )
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
@@ -1123,7 +1136,7 @@ def render_app() -> None:
                         mime="image/vnd.adobe.photoshop",
                         use_container_width=True,
                     )
-                st.caption("CMYK + W1 Spot · 灰階白墨 · ExtraSamples=UNSPECIFIED · PrintEXP Spot 可匯入")
+                st.caption("RGB + W1 New Spot · 完整白墨底圖 · ExtraSamples=UNSPECIFIED · PrintEXP Spot")
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
 
@@ -1151,15 +1164,15 @@ def render_app() -> None:
     with right:
         st.markdown(
             '<div class="panel-title">通道</div>'
-            '<div class="panel-copy">與 Photoshop / PrintEXP 相同：CMYK + W1。可切換原始覆蓋與內縮後白墨。</div>',
+            '<div class="panel-copy">與 Photoshop 相同：RGB + W1 New Spot。可切換原始覆蓋與內縮後白墨。</div>',
             unsafe_allow_html=True,
         )
         preview_choice = st.radio(
             "白墨遮罩對比預覽",
-            options=["CMYK", "W1", "原始 Alpha", "內縮後白墨"],
-            index=0,
+            options=["RGB", "W1", "原始 Alpha", "內縮後白墨"],
+            index=1,
             horizontal=True,
-            help="原始 Alpha = 未內縮覆蓋；內縮後白墨 / W1 = 實際寫入 TIFF 的專色通道。",
+            help="W1 / 內縮後白墨 = 完整白墨底圖；應覆蓋整塊設計，不是局部做舊。",
         )
         render_channel_panel(inspect_doc or generated_doc, preview_choice)
 
