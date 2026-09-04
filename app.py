@@ -16,6 +16,7 @@ import html
 import io
 import struct
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
 
 import numpy as np
@@ -29,6 +30,7 @@ from psdtags import (
     PsdPascalStringsBlock,
     PsdResourceId,
     PsdStringsBlock,
+    PsdVersionBlock,
     TiffImageResources,
 )
 
@@ -267,8 +269,22 @@ def _alternate_spot_colors(count: int, start_id: int = 3) -> bytes:
     return b"".join(parts)
 
 
-def _photoshop_spot_tags(channel_names: list[str]) -> tuple:
-    """ImageResources so PrintEXP / Photoshop treat extras as named Spot channels."""
+def _resolution_info_bytes(dpi: float) -> bytes:
+    fixed = int(round(float(dpi) * 65536.0)) & 0xFFFFFFFF
+    return struct.pack(">IHH IHH", fixed, 1, 1, fixed, 1, 1)
+
+
+def _srgb_icc_profile() -> bytes | None:
+    try:
+        from PIL import ImageCms
+
+        return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    except Exception:
+        return None
+
+
+def _photoshop_spot_tags(channel_names: list[str], dpi: float = DEFAULT_DPI) -> tuple:
+    """Photoshop ImageResources so PrintEXP treats extras as named New Spot channels."""
     if not channel_names:
         raise ValueError("至少需要一個專色通道名稱")
     count = len(channel_names)
@@ -278,6 +294,10 @@ def _photoshop_spot_tags(channel_names: list[str]) -> tuple:
         name=f"{channel_names[0]}.tif",
         psdformat=PsdFormat.BE32BIT,
         blocks=[
+            PsdBytesBlock(
+                resourceid=PsdResourceId.RESOLUTION_INFO,
+                value=_resolution_info_bytes(dpi),
+            ),
             PsdPascalStringsBlock(
                 resourceid=PsdResourceId.ALPHA_NAMES_PASCAL,
                 values=channel_names,
@@ -298,6 +318,14 @@ def _photoshop_spot_tags(channel_names: list[str]) -> tuple:
                 resourceid=PsdResourceId.ALTERNATE_SPOT_COLORS,
                 value=_alternate_spot_colors(count, start_id=start_id),
             ),
+            PsdVersionBlock(
+                resourceid=PsdResourceId.VERSION_INFO,
+                version=1,
+                file_version=1,
+                writer_name="Adobe Photoshop",
+                reader_name="Adobe Photoshop",
+                has_real_merged_data=True,
+            ),
         ],
     )
     return resources.tifftag()
@@ -310,25 +338,39 @@ def write_tiff_with_white(
     channel_name: str = WHITE_CHANNEL_NAME,
     compression: str = "none",
     alpha: np.ndarray | None = None,
+    include_w2: bool = False,
 ) -> bytes:
-    """Lossless RGB TIFF + New Spot Channel (default W1) for PrintEXP / Maintop."""
+    """Lossless RGB TIFF + New Spot Channel(s) for PrintEXP / Maintop import."""
     del alpha  # RGB composite is flattened already; spot is the white underbase.
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("rgb 必須是 HxWx3")
     if white.shape != rgb.shape[:2]:
         raise ValueError("white 通道尺寸必須與 RGB 相同")
 
-    stacked = np.concatenate([rgb, white[..., None]], axis=2).astype(np.uint8)
+    channel_names = [channel_name]
+    planes = [rgb, white[..., None]]
+    if include_w2:
+        # DTF adhesive / optional second spot — same solid underbase as W1.
+        channel_names.append("W2")
+        planes.append(white[..., None])
+
+    stacked = np.concatenate(planes, axis=2).astype(np.uint8, copy=False)
+    extras = tuple(0 for _ in channel_names)
     buf = io.BytesIO()
     options = dict(
         photometric="rgb",
-        extrasamples=[0],
+        extrasamples=extras,
         planarconfig="contig",
-        metadata=None,
+        metadata=False,
         resolution=(float(dpi), float(dpi)),
         resolutionunit="inch",
-        extratags=[_photoshop_spot_tags([channel_name])],
+        software="Adobe Photoshop 25.0 (Windows)",
+        datetime=datetime.now().strftime("%Y:%m:%d %H:%M:%S"),
+        extratags=[_photoshop_spot_tags(channel_names, dpi=dpi)],
     )
+    icc = _srgb_icc_profile()
+    if icc:
+        options["iccprofile"] = icc
     if compression == "zip":
         options["compression"] = "adobe_deflate"
     imwrite(buf, stacked, **options)
@@ -1077,13 +1119,18 @@ def render_app() -> None:
                 "專色通道名稱（PrintEXP 必須為 W1）",
                 ["W1", "W2", "white", "White"],
                 index=0,
-                help="PrintEXP / Maintop Spot 模式認 W1 為白墨。W2 通常是光油。",
+                help="PrintEXP / Maintop Spot 模式認 W1 為白墨。",
+            )
+            include_w2 = st.checkbox(
+                "同時輸出 W2（DTF 膠層，複製 W1）",
+                value=False,
+                help="有啲 DTF / Maintop 流程要 W1+W2。UV PrintEXP 光油通常可唔加，Channel 2 設 None。",
             )
             dpi_override = st.number_input("DPI", min_value=72, max_value=600, value=DEFAULT_DPI)
             compression = st.radio(
                 "TIFF",
                 ["none", "zip"],
-                format_func=lambda x: "無壓縮（RIP 最穩）" if x == "none" else "ZIP 無損（檔案較小）",
+                format_func=lambda x: "無壓縮（RIP / PrintEXP 最穩）" if x == "none" else "ZIP 無損（檔案較小）",
                 horizontal=True,
             )
 
@@ -1109,6 +1156,7 @@ def render_app() -> None:
                     channel_name=channel_name,
                     compression=compression,
                     alpha=result.alpha,
+                    include_w2=bool(include_w2),
                 )
                 psd_bytes = write_psd_with_white(
                     result.rgb,
@@ -1136,7 +1184,13 @@ def render_app() -> None:
                         mime="image/vnd.adobe.photoshop",
                         use_container_width=True,
                     )
-                st.caption("RGB + W1 New Spot · 完整白墨底圖 · ExtraSamples=UNSPECIFIED · PrintEXP Spot")
+                st.caption(
+                    "RGB + New Spot(W1) · 完整白墨底 · Photoshop TIFF 結構 · PrintEXP 請用 Spot 模式匯入"
+                )
+                st.info(
+                    "PrintEXP：匯入 TIFF → Spot channel → Data Source Type 選 **Spot** → Channel 1 = 白墨。"
+                    "若仍然打唔開檔，試勾「同時輸出 W2」，或話我知報錯內容。"
+                )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
 
