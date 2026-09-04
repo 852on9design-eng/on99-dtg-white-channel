@@ -32,6 +32,7 @@ from tiff_export import (
     DEFAULT_SPOT_NAME,
     ExportMode,
     inspect_spot_metadata,
+    safe_download_stem,
     write_tiff_with_spot,
 )
 
@@ -259,14 +260,12 @@ def write_tiff_with_white(
     compression: str = "none",
     alpha: np.ndarray | None = None,
     include_w2: bool = False,
-    export_mode: ExportMode = "printexp_spot",
+    export_mode: ExportMode = "printexp_cmyk_spot",
     varnish_name: str = "varnish",
 ) -> bytes:
-    """Delegate to tiff_export — PrintEXP Spot (default) or Legacy ExtraSamples."""
-    del alpha
+    """Delegate to tiff_export — PrintEXP CMYK+Spot (default) / RGB+Spot / Legacy."""
     varnish = white.copy() if include_w2 else None
     if include_w2:
-        # Maintop-style second plate keeps W2; PrintEXP factory uses varnish.
         second = "W2" if channel_name in {"W1", "W2"} else varnish_name
     else:
         second = varnish_name
@@ -279,6 +278,7 @@ def write_tiff_with_white(
         varnish=varnish,
         varnish_name=second,
         compression=compression,
+        alpha=alpha,
     )
 
 
@@ -525,7 +525,7 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         status="generated",
         channels=channels,
         extra_names=[channel_name],
-        note=f"已寫入 RGB + Photoshop Spot「{channel_name}」。完整白墨底圖（整塊設計鋪白）。",
+        note=f"已寫入 Photoshop Spot「{channel_name}」完整白墨底。預設 CMYK+Spot 俾 PrintExp Import。",
         rgb=result.rgb,
         white=result.white,
         alpha=result.alpha,
@@ -971,7 +971,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>上傳透明 PNG，輸出 RGB + Photoshop Spot「white」（完整白墨底）TIFF，給 PrintEXP Spot 模式 Import。</p>
+          <p>上傳透明 PNG，輸出 PrintEXP 可 Import 的 CMYK + Spot「white」TIFF（完整白墨底）。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -982,7 +982,7 @@ def render_app() -> None:
     with left:
         st.markdown(
             '<div class="panel-title">輸入</div>'
-            '<div class="panel-copy">點選上傳透明 PNG。Spot「white」為整塊設計完整白墨底，並向內縮避免露白。</div>',
+            '<div class="panel-copy">點選上傳透明 PNG。預設輸出 CMYK + Spot「white」完整白墨底（跟 Photoshop 印前檔接近）。</div>',
             unsafe_allow_html=True,
         )
         source = st.file_uploader(
@@ -1022,13 +1022,13 @@ def render_app() -> None:
             )
             export_mode = st.radio(
                 "匯出相容模式",
-                ["printexp_spot", "legacy_extrasamples"],
-                format_func=lambda x: (
-                    "PrintExp Spot（預設，Photoshop Spot Color）"
-                    if x == "printexp_spot"
-                    else "Legacy ExtraSamples（舊輸出，僅對照）"
-                ),
-                help="PrintExp Spot 會寫 DisplayInfo kind=2 + Alternate Spot Colors。Legacy 只有 ALPHA_NAMES，PrintExp 會 Invalid。",
+                ["printexp_cmyk_spot", "printexp_rgb_spot", "legacy_extrasamples"],
+                format_func=lambda x: {
+                    "printexp_cmyk_spot": "PrintExp CMYK+Spot（預設，最接近廠方 TIFF）",
+                    "printexp_rgb_spot": "PrintExp RGB+Spot（影片 RGB 模式）",
+                    "legacy_extrasamples": "Legacy ExtraSamples（舊輸出對照）",
+                }[x],
+                help="CMYK+Spot 同 Photoshop 印前專色 TIFF 結構一致。若仍 Invalid，改試 RGB+Spot，並檢查檔名無括號。",
             )
             channel_name = st.selectbox(
                 "Spot 通道名稱（廠方影片 = white）",
@@ -1081,7 +1081,7 @@ def render_app() -> None:
                     channel_name=channel_name,
                     alpha=result.alpha,
                 )
-                stem = source.name.rsplit(".", 1)[0]
+                stem = safe_download_stem(source.name)
                 d1, d2 = st.columns(2)
                 with d1:
                     st.download_button(
@@ -1102,12 +1102,13 @@ def render_app() -> None:
                     )
                 meta = inspect_spot_metadata(tiff_bytes)
                 st.caption(
-                    f"RGB + Spot「{channel_name}」· mode={export_mode} · "
-                    f"photoshop_spot={meta['is_photoshop_spot']} · kinds={meta['spot_kinds']}"
+                    f"{meta.get('color_space','?').upper()} + Spot「{channel_name}」· "
+                    f"mode={export_mode} · spot={meta['is_photoshop_spot']} · "
+                    f"spp={meta['samples']} · file={stem}_{channel_name}.tif"
                 )
                 st.info(
-                    "PrintExp：Import TIFF → white Color → Data Source Type = **Spot**。"
-                    "Photoshop 打開應喺 Channels 見到 Spot「white」（唔係 Alpha）。"
+                    "PrintExp：Import 呢個 .tif（檔名已去掉空格/括號）→ white Color → "
+                    "**Data Source Type = Spot**。若仍 Invalid，切換匯出模式再試，或把報錯截圖發我。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")

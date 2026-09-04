@@ -1,26 +1,22 @@
 """PrintEXP-compatible TIFF export for ON99 white underbase.
 
-Why old files failed
---------------------
-Hoson PrintEXP (V5.8.x) Spot mode expects a Photoshop *Spot Color Channel*.
-Writing RGB + ExtraSamples and labeling them with ALPHA_NAMES only creates an
-Alpha/ExtraSamples channel. PrintEXP then reports ``Invalid image format``.
+Hoson PrintEXP Spot mode needs a Photoshop Spot Color Channel. ExtraSamples
+labeled only with ALPHA_NAMES are treated as Alpha and often yield
+``Invalid image format``.
 
-Factory workflow
-----------------
-Photoshop → Channels → New Spot Channel, name ``white`` (optional ``varnish``),
-Solidity 100% → Save As TIFF with Spot Colors (+ Alpha Channels) checked →
-PrintEXP Import with white Color Data Source Type = Spot.
+Default export matches a Photoshop-saved print file shape:
+**CMYK (Separated) + Spot ``white``**, with DisplayInfo kind=2 and Alternate
+Spot Colors — the same pattern as known-good UV/DTF spot TIFFs.
 
-This module writes Adobe TIFF ImageResources (tag 34377) so Photoshop shows a
-true Spot Channel (DisplayInfo kind=2 + Alternate Spot Colors + Spot Halftone),
-not a plain Alpha name.
+RGB + Spot remains available as an alternate mode.
 """
 
 from __future__ import annotations
 
+import re
 import struct
 from datetime import datetime
+from io import BytesIO
 from typing import Literal
 
 import numpy as np
@@ -36,13 +32,50 @@ from psdtags import (
     TiffImageResources,
 )
 
-ExportMode = Literal["printexp_spot", "legacy_extrasamples"]
+ExportMode = Literal["printexp_cmyk_spot", "printexp_rgb_spot", "legacy_extrasamples"]
+ColorSpace = Literal["cmyk", "rgb"]
 
 DEFAULT_SPOT_NAME = "white"
 DEFAULT_VARNISH_NAME = "varnish"
 DEFAULT_DPI = 300
-SPOT_KIND = 2  # Photoshop DisplayInfo: 0=selected, 1=protected, 2=spot color
+SPOT_KIND = 2  # Photoshop DisplayInfo: 2 = spot color
 SPOT_START_ID = 3
+
+
+def safe_download_stem(name: str) -> str:
+    """PrintEXP / Windows loaders often choke on spaces and parentheses."""
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    stem = stem.strip().replace(" ", "_")
+    stem = re.sub(r"[^\w.\-]+", "_", stem, flags=re.UNICODE)
+    stem = re.sub(r"_+", "_", stem).strip("._-")
+    return stem or "artwork"
+
+
+def rgb_alpha_to_cmyk(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """RGB(+alpha) → CMYK ink. Fully transparent pixels stay ink-free."""
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("rgb 必須是 HxWx3")
+    if alpha.shape != rgb.shape[:2]:
+        raise ValueError("alpha 尺寸必須與 RGB 相同")
+
+    r = rgb[:, :, 0].astype(np.float32) / 255.0
+    g = rgb[:, :, 1].astype(np.float32) / 255.0
+    b = rgb[:, :, 2].astype(np.float32) / 255.0
+    a = alpha.astype(np.float32) / 255.0
+
+    k = 1.0 - np.maximum(np.maximum(r, g), b)
+    denom = np.maximum(1.0 - k, 1e-6)
+    c = (1.0 - r - k) / denom
+    m = (1.0 - g - k) / denom
+    y = (1.0 - b - k) / denom
+    pure_black = k >= (1.0 - 1e-6)
+    c = np.where(pure_black, 0.0, c)
+    m = np.where(pure_black, 0.0, m)
+    y = np.where(pure_black, 0.0, y)
+
+    cmyk = np.stack([c, m, y, k], axis=-1) * a[..., None]
+    cmyk[alpha == 0] = 0.0
+    return np.clip(np.rint(cmyk * 255.0), 0, 255).astype(np.uint8)
 
 
 def _resolution_info_bytes(dpi: float) -> bytes:
@@ -50,35 +83,21 @@ def _resolution_info_bytes(dpi: float) -> bytes:
     return struct.pack(">IHH IHH", fixed, 1, 1, fixed, 1, 1)
 
 
-def _srgb_icc_profile() -> bytes | None:
-    try:
-        from PIL import ImageCms
-
-        return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
-    except Exception:
-        return None
-
-
 def _display_info_obsolete(count: int) -> bytes:
-    """Resource 1007 — older DisplayInfo with kind=2 (spot) + padding byte."""
     parts: list[bytes] = []
     for _ in range(count):
-        # colorspace HSB, vivid overlay, opacity 100, kind=spot, pad
         parts.append(struct.pack(">h4HHBB", 1, 0, 65535, 65535, 0, 100, SPOT_KIND, 0))
     return b"".join(parts)
 
 
 def _display_info_cs3(count: int) -> bytes:
-    """Resource 1077 — CS3+ DisplayInfo; kind=2 marks Spot Color."""
-    parts = [struct.pack(">I", 1)]  # version
+    parts = [struct.pack(">I", 1)]
     for _ in range(count):
-        # Match Photoshop-saved spot TIFF (opacity field 0, kind=2).
         parts.append(struct.pack(">h4HHb", 1, 0, 65535, 65535, 0, 0, SPOT_KIND))
     return b"".join(parts)
 
 
 def _alternate_spot_colors(count: int, start_id: int = SPOT_START_ID) -> bytes:
-    """Resource 1067 — Alternate Spot Colors (Lab placeholders)."""
     parts = [struct.pack(">HH", 1, count)]
     for index in range(count):
         channel_id = start_id + index
@@ -87,19 +106,15 @@ def _alternate_spot_colors(count: int, start_id: int = SPOT_START_ID) -> bytes:
 
 
 def _spot_halftone(count: int) -> bytes:
-    """Resource 1043 — Spot Halftone, sized like Photoshop RGB/CMYK spot TIFFs."""
-    # Copied structure from a Photoshop CC spot TIFF (one screen descriptor).
     base = bytes.fromhex(
         "00060002000000000001000000000000000000000000000000000001000000000000000000000000"
     )
     if count <= 1:
         return base
-    # Duplicate screen block for additional spot plates.
     return base + base[4:]
 
 
 def _alpha_identifiers(count: int, start_id: int = SPOT_START_ID) -> bytes:
-    """Non-zero IDs — 0 would mean transparency alpha, not spot."""
     return b"".join(struct.pack(">I", start_id + i) for i in range(count))
 
 
@@ -107,7 +122,6 @@ def photoshop_spot_image_resources(
     channel_names: list[str],
     dpi: float = DEFAULT_DPI,
 ) -> tuple:
-    """Full ImageResources so Photoshop/PrintEXP treat extras as Spot Colors."""
     if not channel_names:
         raise ValueError("至少需要一個 Spot 通道名稱")
     count = len(channel_names)
@@ -161,7 +175,6 @@ def photoshop_spot_image_resources(
 
 
 def photoshop_legacy_alpha_resources(channel_names: list[str]) -> tuple:
-    """Legacy ExtraSamples labeling — Alpha names only (PrintEXP Spot will fail)."""
     resources = TiffImageResources(
         name=f"{channel_names[0]}.tif",
         psdformat=PsdFormat.BE32BIT,
@@ -184,23 +197,18 @@ def write_tiff_with_spot(
     white: np.ndarray,
     dpi: float = DEFAULT_DPI,
     *,
-    mode: ExportMode = "printexp_spot",
+    mode: ExportMode = "printexp_cmyk_spot",
     channel_name: str = DEFAULT_SPOT_NAME,
     varnish: np.ndarray | None = None,
     varnish_name: str = DEFAULT_VARNISH_NAME,
     compression: str = "none",
+    alpha: np.ndarray | None = None,
 ) -> bytes:
-    """Write RGB TIFF + spot/extra plane(s).
+    """Write print TIFF + Spot plane(s).
 
-    Parameters
-    ----------
-    mode:
-        ``printexp_spot`` — Photoshop Spot Color metadata (default, PrintEXP).
-        ``legacy_extrasamples`` — ALPHA_NAMES only (old App output, for compare).
-    channel_name:
-        Factory PrintEXP video uses ``white``. Maintop often uses ``W1``.
-    varnish:
-        Optional second spot plane (e.g. varnish / adhesive).
+    ``printexp_cmyk_spot`` (default): Photometric SEPARATED CMYK + Spot white.
+    ``printexp_rgb_spot``: RGB + Spot white.
+    ``legacy_extrasamples``: RGB + ExtraSamples with ALPHA_NAMES only.
     """
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError("rgb 必須是 HxWx3")
@@ -208,9 +216,21 @@ def write_tiff_with_spot(
         raise ValueError("white 通道尺寸必須與 RGB 相同")
     if varnish is not None and varnish.shape != white.shape:
         raise ValueError("varnish 尺寸必須與 white 相同")
+    if alpha is None:
+        alpha = np.full(white.shape, 255, dtype=np.uint8)
+    elif alpha.shape != white.shape:
+        raise ValueError("alpha 尺寸必須與 white 相同")
 
     names = [channel_name]
-    planes: list[np.ndarray] = [rgb, white[..., None]]
+    use_cmyk = mode == "printexp_cmyk_spot"
+    if use_cmyk:
+        base = rgb_alpha_to_cmyk(rgb, alpha)
+        photometric = "separated"
+    else:
+        base = rgb
+        photometric = "rgb"
+
+    planes: list[np.ndarray] = [base, white[..., None]]
     if varnish is not None:
         names.append(varnish_name)
         planes.append(varnish[..., None])
@@ -218,8 +238,12 @@ def write_tiff_with_spot(
     stacked = np.concatenate(planes, axis=2).astype(np.uint8, copy=False)
     extras = tuple(0 for _ in names)
 
-    if mode == "printexp_spot":
-        extratags = [photoshop_spot_image_resources(names, dpi=dpi)]
+    if mode in {"printexp_cmyk_spot", "printexp_rgb_spot"}:
+        extratags = [
+            (254, "I", 1, 0, False),  # NewSubfileType
+            (274, "H", 1, 1, False),  # Orientation
+            photoshop_spot_image_resources(names, dpi=dpi),
+        ]
         software = "Adobe Photoshop 25.0 (Windows)"
     elif mode == "legacy_extrasamples":
         extratags = [photoshop_legacy_alpha_resources(names)]
@@ -227,8 +251,9 @@ def write_tiff_with_spot(
     else:
         raise ValueError(f"未知 export mode: {mode}")
 
+    # Intentionally no ICC: some PrintEXP builds reject exotic profiles.
     options: dict = dict(
-        photometric="rgb",
+        photometric=photometric,
         extrasamples=extras,
         planarconfig="contig",
         metadata=False,
@@ -238,16 +263,10 @@ def write_tiff_with_spot(
         datetime=datetime.now().strftime("%Y:%m:%d %H:%M:%S"),
         extratags=extratags,
     )
-    if mode == "printexp_spot":
-        icc = _srgb_icc_profile()
-        if icc:
-            options["iccprofile"] = icc
     if compression == "zip":
         options["compression"] = "adobe_deflate"
     elif compression == "lzw":
         options["compression"] = "lzw"
-
-    from io import BytesIO
 
     buf = BytesIO()
     imwrite(buf, stacked, **options)
@@ -256,8 +275,6 @@ def write_tiff_with_spot(
 
 def inspect_spot_metadata(file_bytes: bytes) -> dict:
     """Parse TIFF ImageResources and report Spot vs Alpha markers."""
-    from io import BytesIO
-
     with TiffFile(BytesIO(file_bytes)) as tif:
         page = tif.pages[0]
         photometric = int(page.photometric)
@@ -269,23 +286,24 @@ def inspect_spot_metadata(file_bytes: bytes) -> dict:
         tag = page.tags.get(34377)
         ir_bytes = tag.value if tag is not None else None
 
+    empty = {
+        "photometric": photometric,
+        "samples": samples,
+        "extrasamples": extras,
+        "software": software,
+        "names": [],
+        "has_display_info": False,
+        "has_display_info_obsolete": False,
+        "has_alternate_spot": False,
+        "has_spot_halftone": False,
+        "spot_kinds": [],
+        "is_photoshop_spot": False,
+        "color_space": "cmyk" if photometric == 5 else "rgb",
+    }
     if ir_bytes is None:
-        return {
-            "photometric": photometric,
-            "samples": samples,
-            "extrasamples": extras,
-            "software": software,
-            "names": [],
-            "has_display_info": False,
-            "has_display_info_obsolete": False,
-            "has_alternate_spot": False,
-            "has_spot_halftone": False,
-            "spot_kinds": [],
-            "is_photoshop_spot": False,
-        }
+        return empty
 
     ir = TiffImageResources.frombytes(ir_bytes)
-
     names: list[str] = []
     has_display = False
     has_alt = False
@@ -302,7 +320,6 @@ def inspect_spot_metadata(file_bytes: bytes) -> dict:
         elif rid == int(PsdResourceId.DISPLAY_INFO):
             has_display = True
             raw = block.value
-            # version(4) + repeated 13-byte records ending with kind
             off = 4
             while off + 13 <= len(raw):
                 spot_kinds.append(raw[off + 12])
@@ -333,4 +350,5 @@ def inspect_spot_metadata(file_bytes: bytes) -> dict:
         "has_spot_halftone": has_spot_halftone,
         "spot_kinds": spot_kinds,
         "is_photoshop_spot": is_spot,
+        "color_space": "cmyk" if photometric == 5 else "rgb",
     }
