@@ -2,11 +2,16 @@
 
 確認規格（最新）：
 - 只需 **一個** 白墨 Photoshop Spot Channel（預設名 `white`）。
-- 白墨底必須跟面層：懷舊／甩色的破洞與侵蝕，白墨覆蓋同樣跟隨。
-- 再用 **Choke（內縮）標桿** 略收白墨，令白邊永不露出彩墨之外。
+- 白墨底 = 原圖 **有墨的地方**（跟 Alpha／退地）：
+  - 退地／透明 → 不打白
+  - 甩色破洞（透明）→ 不打白（照原圖，不補白）
+  - 彩墨 **同黑墨**（含下端黑字、勾線）→ **都要打白底**
+- 再用 **Choke** 略收，避免白邊露出彩墨。
+
+注意：唔好用「見黑就不打白」——會誤殺黑墨底；
+亦唔好「整塊補白」填甩色洞——會改原圖效果。
 
 輸出：PrintEXP 可 Import 的 TIFF（預設 CMYK+Spot `white`；亦可 RGB+Spot）。
-右側可對比面層覆蓋 vs 內縮白墨，並檢查既有 TIFF 是否已有 white Spot。
 
 啟動：
     pip install -r requirements.txt
@@ -43,8 +48,6 @@ from tiff_export import (
 WHITE_CHANNEL_NAME = "white"
 DEFAULT_CHOKE_PX = 2
 DEFAULT_DPI = 300
-DEFAULT_BLACK_CUTOFF = 18
-DEFAULT_BLACK_FEATHER = 28
 MAX_PREVIEW_EDGE = 640
 WHITE_NAME_ALIASES = {
     "w1",
@@ -130,32 +133,18 @@ def flatten_rgb(rgba: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return rgb, alpha
 
 
-def _smoothstep(value: np.ndarray, low: float, high: float) -> np.ndarray:
-    span = max(high - low, 1.0)
-    t = np.clip((value - low) / span, 0.0, 1.0)
-    return t * t * (3.0 - 2.0 * t)
+def ink_coverage(alpha: np.ndarray) -> np.ndarray:
+    """白墨底來源 = 原圖 Alpha（退地／甩色破洞）。
 
-
-def solid_underbase(alpha: np.ndarray) -> np.ndarray:
-    """Optional solid flood: every opaque pixel gets full white (no distress follow)."""
-    return np.where(alpha > 0, np.uint8(255), np.uint8(0))
-
-
-def ink_coverage(
-    rgb: np.ndarray,
-    alpha: np.ndarray,
-    black_cutoff: int = DEFAULT_BLACK_CUTOFF,
-    black_feather: int = DEFAULT_BLACK_FEATHER,
-) -> np.ndarray:
-    """面層可見墨量＝白墨底跟隨來源（甩色／破洞／半透明一齊跟）。"""
-    a = alpha.astype(np.float32) / 255.0
-    peak = rgb.max(axis=2).astype(np.float32)
-    color = _smoothstep(peak, float(black_cutoff), float(black_cutoff + black_feather))
-    return np.clip(a * color * 255.0, 0, 255).astype(np.uint8)
+    - 透明／退地 → 0（不打白）
+    - 半透明甩色 → 跟透明度
+    - 不透明彩墨 **同黑墨** → 打白（唔會因為顏色係黑就跳過）
+    """
+    return alpha.astype(np.uint8, copy=True)
 
 
 def choke_grayscale(mask: np.ndarray, pixels: int) -> np.ndarray:
-    """Choke 標桿：向內侵蝕 N px，略縮白墨底，避免白邊露出彩墨。"""
+    """Choke：向內侵蝕 N px，略縮白墨底，避免白邊露出彩墨。"""
     mask = mask.astype(np.uint8, copy=False)
     if pixels <= 0:
         return mask
@@ -170,19 +159,12 @@ def choke_grayscale(mask: np.ndarray, pixels: int) -> np.ndarray:
 
 
 def build_white_channel(
-    rgb: np.ndarray,
     alpha: np.ndarray,
     choke_px: int,
-    black_cutoff: int,
-    black_feather: int,
     polarity: ChannelPolarity,
-    solid: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """預設跟面層甩色；可選 solid 整塊鋪白。再經 choke 略收防露白。"""
-    if solid:
-        coverage = solid_underbase(alpha)
-    else:
-        coverage = ink_coverage(rgb, alpha, black_cutoff, black_feather)
+    """全圖有墨位打白（含黑墨）；甩色／退地跟 Alpha；再 choke。"""
+    coverage = ink_coverage(alpha)
     white = choke_grayscale(coverage, choke_px)
     if polarity == "black_prints":
         white = (255 - white).astype(np.uint8)
@@ -193,17 +175,12 @@ def process_artwork(
     file_bytes: bytes,
     filename: str,
     choke_px: int,
-    black_cutoff: int,
-    black_feather: int,
     polarity: ChannelPolarity,
     dpi_override: float | None = None,
-    solid: bool = False,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
-    coverage, white = build_white_channel(
-        rgb, alpha, choke_px, black_cutoff, black_feather, polarity, solid=solid
-    )
+    coverage, white = build_white_channel(alpha, choke_px, polarity)
     return ProcessResult(
         rgb=rgb,
         alpha=alpha,
@@ -513,7 +490,7 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
             shortcut="Ctrl+6",
             is_white=True,
             is_new=True,
-            subtitle="唯一白墨 Spot",
+            subtitle="唯一白墨 Spot（含黑墨底）",
         )
     )
     return ChannelDocument(
@@ -528,7 +505,7 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         extra_names=[channel_name],
         note=(
             f"已寫入唯一 Spot「{channel_name}」。"
-            "白墨跟面層甩色／侵蝕；再經 Choke 內縮，白邊不應露出彩墨。"
+            "有墨位（含黑墨）打白；退地／甩色透明位不打白、不補洞；再 Choke 防露白。"
         ),
         rgb=result.rgb,
         white=result.white,
@@ -671,7 +648,7 @@ def render_channel_panel(
             <div class="empty-channels">
               <div class="empty-mark"></div>
               <div class="empty-title">通道</div>
-              <div class="empty-copy">製作完成後顯示：唯一白墨 Spot（white）。<br>白墨跟面層甩色，並用 Choke 略縮防露白。</div>
+              <div class="empty-copy">製作完成後顯示唯一 white Spot。<br>有墨（含黑墨）打白；退地／甩色透明不打白、不補洞。</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -687,9 +664,9 @@ def render_channel_panel(
 
     preview_map = {ch.name: ch.image for ch in doc.channels}
     if doc.coverage is not None:
-        preview_map["面層覆蓋（跟甩色）"] = doc.coverage
+        preview_map["退地／甩色覆蓋"] = doc.coverage
     elif doc.alpha is not None:
-        preview_map["面層覆蓋（跟甩色）"] = doc.alpha
+        preview_map["退地／甩色覆蓋"] = doc.alpha
     if doc.white is not None:
         preview_map["內縮白墨（防露白）"] = doc.white
 
@@ -975,7 +952,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>只需一個白墨 Spot。白墨跟面層甩色／侵蝕，再用 Choke 略縮防露白。</p>
+          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -986,14 +963,14 @@ def render_app() -> None:
     with left:
         st.markdown(
             '<div class="panel-title">輸入</div>'
-            '<div class="panel-copy">上傳透明 PNG。只需一個 Spot「white」；懷舊甩色處白墨跟面層，Choke 標桿略收防露白。</div>',
+            '<div class="panel-copy">上傳退地透明 PNG。白墨跟 Alpha：甩色破洞不補白；黑字／黑線一樣有白底。</div>',
             unsafe_allow_html=True,
         )
         source = st.file_uploader(
             "製作白墨 TIFF",
             type=["png", "webp"],
             key="source_png",
-            help="請使用去背透明 PNG。面層有甩色／破洞時，白墨底會跟隨同一覆蓋。",
+            help="背景須為透明退地。甩色破洞應係透明，唔好畫死黑底當甩色。",
             label_visibility="collapsed",
         )
 
@@ -1002,22 +979,9 @@ def render_app() -> None:
             min_value=0,
             max_value=10,
             value=DEFAULT_CHOKE_PX,
-            help="調控白墨比彩墨小幾 px，令白邊不露出。甩色圖建議 2–3。",
+            help="略縮白墨，避免白邊露出彩墨。甩色圖建議 2–3。",
         )
         with st.expander("進階"):
-            solid = st.checkbox(
-                "整塊鋪白（關閉＝跟面層甩色，預設）",
-                value=False,
-                help="關（預設）：白墨跟面層甩色／侵蝕。開：整塊設計實心白底（非甩色圖用）。",
-            )
-            black_cutoff = st.slider(
-                "黑色不鋪白（跟做舊／甩色）",
-                0,
-                60,
-                DEFAULT_BLACK_CUTOFF,
-                help="未勾選「整塊鋪白」時生效：近黑像素不噴白，避免破洞被死白填滿。",
-            )
-            black_feather = st.slider("黑色過渡", 4, 80, DEFAULT_BLACK_FEATHER)
             polarity = st.radio(
                 "極性",
                 ["white_prints", "black_prints"],
@@ -1032,7 +996,7 @@ def render_app() -> None:
                     "printexp_rgb_spot": "PrintExp RGB+Spot（廠方影片）",
                     "legacy_extrasamples": "Legacy ExtraSamples（舊輸出對照）",
                 }[x],
-                help="只需一個白墨 Spot。CMYK+Spot 或 RGB+Spot 皆可；檔名勿含括號。",
+                help="只需一個白墨 Spot。檔名勿含括號。",
             )
             channel_name = st.selectbox(
                 "唯一 Spot 通道名稱",
@@ -1061,11 +1025,8 @@ def render_app() -> None:
                     file_bytes=source.getvalue(),
                     filename=source.name,
                     choke_px=int(choke_px),
-                    black_cutoff=int(black_cutoff),
-                    black_feather=int(black_feather),
                     polarity=polarity,  # type: ignore[arg-type]
                     dpi_override=float(dpi_override),
-                    solid=bool(solid),
                 )
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
@@ -1141,15 +1102,15 @@ def render_app() -> None:
     with right:
         st.markdown(
             '<div class="panel-title">通道</div>'
-            '<div class="panel-copy">唯一 white Spot。可對比「面層覆蓋（跟甩色）」與「內縮白墨（防露白）」。</div>',
+            '<div class="panel-copy">唯一 white Spot。可對比「退地／甩色覆蓋」與「內縮白墨（防露白）」。</div>',
             unsafe_allow_html=True,
         )
         preview_choice = st.radio(
             "白墨遮罩對比預覽",
-            options=["RGB", "white", "面層覆蓋（跟甩色）", "內縮白墨（防露白）"],
+            options=["RGB", "white", "退地／甩色覆蓋", "內縮白墨（防露白）"],
             index=0,
             horizontal=True,
-            help="面層覆蓋＝跟甩色的白墨來源；內縮白墨＝經 Choke 後寫入 TIFF 的唯一 Spot。",
+            help="覆蓋＝跟 Alpha（含黑墨、不含退地／甩色洞）；內縮＝Choke 後寫入 TIFF。",
         )
         render_channel_panel(inspect_doc or generated_doc, preview_choice)
 
