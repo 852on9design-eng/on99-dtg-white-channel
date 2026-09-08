@@ -1,8 +1,12 @@
 """ON99 DTG / DTF 白墨通道生成工具。
 
-從透明 PNG 自動產生 Hoson PrintEXP 可 Import 的 TIFF：
-RGB + Photoshop Spot Color Channel（預設名 white，完整白墨底圖）。
-右側通道面板可預覽產出，也可檢查既有 TIFF 是否已有 white Spot。
+確認規格（最新）：
+- 只需 **一個** 白墨 Photoshop Spot Channel（預設名 `white`）。
+- 白墨底必須跟面層：懷舊／甩色的破洞與侵蝕，白墨覆蓋同樣跟隨。
+- 再用 **Choke（內縮）標桿** 略收白墨，令白邊永不露出彩墨之外。
+
+輸出：PrintEXP 可 Import 的 TIFF（預設 CMYK+Spot `white`；亦可 RGB+Spot）。
+右側可對比面層覆蓋 vs 內縮白墨，並檢查既有 TIFF 是否已有 white Spot。
 
 啟動：
     pip install -r requirements.txt
@@ -133,11 +137,7 @@ def _smoothstep(value: np.ndarray, low: float, high: float) -> np.ndarray:
 
 
 def solid_underbase(alpha: np.ndarray) -> np.ndarray:
-    """Complete white underbase for the whole design (Photoshop New Spot Channel).
-
-    Uses opacity only — every visible pixel gets full white ink, including black
-    artwork. Distressed RGB holes no longer punch gaps in the spot channel.
-    """
+    """Optional solid flood: every opaque pixel gets full white (no distress follow)."""
     return np.where(alpha > 0, np.uint8(255), np.uint8(0))
 
 
@@ -147,7 +147,7 @@ def ink_coverage(
     black_cutoff: int = DEFAULT_BLACK_CUTOFF,
     black_feather: int = DEFAULT_BLACK_FEATHER,
 ) -> np.ndarray:
-    """Optional vintage mode: skip near-black so distressed holes stay empty."""
+    """面層可見墨量＝白墨底跟隨來源（甩色／破洞／半透明一齊跟）。"""
     a = alpha.astype(np.float32) / 255.0
     peak = rgb.max(axis=2).astype(np.float32)
     color = _smoothstep(peak, float(black_cutoff), float(black_cutoff + black_feather))
@@ -155,7 +155,7 @@ def ink_coverage(
 
 
 def choke_grayscale(mask: np.ndarray, pixels: int) -> np.ndarray:
-    """Shrink bright areas by N pixels. Keeps 0–255; never binarizes."""
+    """Choke 標桿：向內侵蝕 N px，略縮白墨底，避免白邊露出彩墨。"""
     mask = mask.astype(np.uint8, copy=False)
     if pixels <= 0:
         return mask
@@ -176,8 +176,9 @@ def build_white_channel(
     black_cutoff: int,
     black_feather: int,
     polarity: ChannelPolarity,
-    solid: bool = True,
+    solid: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """預設跟面層甩色；可選 solid 整塊鋪白。再經 choke 略收防露白。"""
     if solid:
         coverage = solid_underbase(alpha)
     else:
@@ -196,7 +197,7 @@ def process_artwork(
     black_feather: int,
     polarity: ChannelPolarity,
     dpi_override: float | None = None,
-    solid: bool = True,
+    solid: bool = False,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
@@ -512,7 +513,7 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
             shortcut="Ctrl+6",
             is_white=True,
             is_new=True,
-            subtitle="New Spot Channel / 完整白墨底",
+            subtitle="唯一白墨 Spot",
         )
     )
     return ChannelDocument(
@@ -525,7 +526,10 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         status="generated",
         channels=channels,
         extra_names=[channel_name],
-        note=f"已寫入 Photoshop Spot「{channel_name}」完整白墨底。預設 CMYK+Spot 俾 PrintExp Import。",
+        note=(
+            f"已寫入唯一 Spot「{channel_name}」。"
+            "白墨跟面層甩色／侵蝕；再經 Choke 內縮，白邊不應露出彩墨。"
+        ),
         rgb=result.rgb,
         white=result.white,
         alpha=result.alpha,
@@ -554,7 +558,7 @@ def inspect_file(file_bytes: bytes, filename: str) -> ChannelDocument:
         status="missing_white",
         channels=channels,
         extra_names=[],
-        note="這是一般圖，沒有 RIP 用的 W1 專色通道。請用左側製作。",
+        note="這是一般圖，沒有 RIP 用的 white Spot 通道。請用左側製作。",
         rgb=rgb,
         alpha=alpha,
     )
@@ -599,20 +603,20 @@ def _inspect_tiff(file_bytes: bytes, filename: str) -> ChannelDocument:
                 image=plane,
                 shortcut=f"⌘{index + 3}",
                 is_white=is_white,
-                subtitle="白墨通道 W1" if is_white else "額外通道",
+                subtitle="白墨 Spot" if is_white else "額外通道",
             )
         )
 
     if samples <= base_count:
         mode = "CMYK" if is_cmyk else "RGB"
-        note = f"此 TIFF 只有 {mode}，沒有 W1 專色通道。可用左側透明 PNG 重新製作。"
+        note = f"此 TIFF 只有 {mode}，沒有 white Spot 通道。可用左側透明 PNG 重新製作。"
         status: Literal["has_white", "missing_white"] = "missing_white"
     elif found_white:
-        note = "已有 W1 / 白墨專色通道，PrintEXP 可直接匯入。"
+        note = "已有唯一白墨 Spot，PrintEXP 可直接匯入。"
         status = "has_white"
     else:
         extra_label = "、".join(resolved_extras) if resolved_extras else "未命名"
-        note = f"有額外通道（{extra_label}），但名稱不是 W1。PrintEXP Spot 模式可能認不出白墨。"
+        note = f"有額外通道（{extra_label}），但名稱不是 white／W1。PrintEXP Spot 模式可能認不出白墨。"
         status = "missing_white"
 
     return ChannelDocument(
@@ -667,7 +671,7 @@ def render_channel_panel(
             <div class="empty-channels">
               <div class="empty-mark"></div>
               <div class="empty-title">通道</div>
-              <div class="empty-copy">製作完成後，這裡會出現與 Photoshop 相同的通道：<br>RGB + W1 New Spot（完整白墨底圖）。</div>
+              <div class="empty-copy">製作完成後顯示：唯一白墨 Spot（white）。<br>白墨跟面層甩色，並用 Choke 略縮防露白。</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -675,19 +679,19 @@ def render_channel_panel(
         return
 
     if doc.status == "generated":
-        tone, label = "ok", "已新增 W1"
+        tone, label = "ok", "已新增 white Spot"
     elif doc.status == "has_white":
-        tone, label = "ok", "已有 W1，不必重做"
+        tone, label = "ok", "已有 white，不必重做"
     else:
-        tone, label = "warn", "沒有 W1 通道"
+        tone, label = "warn", "沒有 white Spot"
 
     preview_map = {ch.name: ch.image for ch in doc.channels}
     if doc.coverage is not None:
-        preview_map["原始 Alpha"] = doc.coverage
+        preview_map["面層覆蓋（跟甩色）"] = doc.coverage
     elif doc.alpha is not None:
-        preview_map["原始 Alpha"] = doc.alpha
+        preview_map["面層覆蓋（跟甩色）"] = doc.alpha
     if doc.white is not None:
-        preview_map["內縮後白墨"] = doc.white
+        preview_map["內縮白墨（防露白）"] = doc.white
 
     preview_src = preview_map.get(preview_choice)
     if preview_src is None:
@@ -697,7 +701,7 @@ def render_channel_panel(
     for ch in doc.channels:
         badge = ""
         row_class = "ch-row"
-        white_previews = {"內縮後白墨", "white", "W1", "W2", "varnish"}
+        white_previews = {"內縮白墨（防露白）", "white", "W1", "W2", "varnish"}
         if ch.name == preview_choice or (preview_choice in white_previews and ch.is_white):
             row_class += " ch-active"
         if ch.is_white:
@@ -971,7 +975,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>上傳透明 PNG，輸出 PrintEXP 可 Import 的 CMYK + Spot「white」TIFF（完整白墨底）。</p>
+          <p>只需一個白墨 Spot。白墨跟面層甩色／侵蝕，再用 Choke 略縮防露白。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -982,36 +986,36 @@ def render_app() -> None:
     with left:
         st.markdown(
             '<div class="panel-title">輸入</div>'
-            '<div class="panel-copy">點選上傳透明 PNG。預設輸出 CMYK + Spot「white」完整白墨底（跟 Photoshop 印前檔接近）。</div>',
+            '<div class="panel-copy">上傳透明 PNG。只需一個 Spot「white」；懷舊甩色處白墨跟面層，Choke 標桿略收防露白。</div>',
             unsafe_allow_html=True,
         )
         source = st.file_uploader(
             "製作白墨 TIFF",
             type=["png", "webp"],
             key="source_png",
-            help="請使用去背透明 PNG。",
+            help="請使用去背透明 PNG。面層有甩色／破洞時，白墨底會跟隨同一覆蓋。",
             label_visibility="collapsed",
         )
 
         choke_px = st.slider(
-            "白墨內縮像素 (Choke Limit)",
+            "白墨內縮標桿 (Choke)",
             min_value=0,
             max_value=10,
             value=DEFAULT_CHOKE_PX,
-            help="白墨比彩圖小一圈。0 仍可能露白，建議 2。",
+            help="調控白墨比彩墨小幾 px，令白邊不露出。甩色圖建議 2–3。",
         )
         with st.expander("進階"):
             solid = st.checkbox(
-                "完整白墨底圖（建議開）",
-                value=True,
-                help="開：整塊設計都鋪白（影片 New Spot 做法）。關：做舊模式，黑位不鋪白。",
+                "整塊鋪白（關閉＝跟面層甩色，預設）",
+                value=False,
+                help="關（預設）：白墨跟面層甩色／侵蝕。開：整塊設計實心白底（非甩色圖用）。",
             )
             black_cutoff = st.slider(
-                "黑色不鋪白（僅做舊模式）",
+                "黑色不鋪白（跟做舊／甩色）",
                 0,
                 60,
                 DEFAULT_BLACK_CUTOFF,
-                help="只在關閉「完整白墨底圖」時生效。",
+                help="未勾選「整塊鋪白」時生效：近黑像素不噴白，避免破洞被死白填滿。",
             )
             black_feather = st.slider("黑色過渡", 4, 80, DEFAULT_BLACK_FEATHER)
             polarity = st.radio(
@@ -1024,22 +1028,22 @@ def render_app() -> None:
                 "匯出相容模式",
                 ["printexp_cmyk_spot", "printexp_rgb_spot", "legacy_extrasamples"],
                 format_func=lambda x: {
-                    "printexp_cmyk_spot": "PrintExp CMYK+Spot（預設，最接近廠方 TIFF）",
-                    "printexp_rgb_spot": "PrintExp RGB+Spot（影片 RGB 模式）",
+                    "printexp_cmyk_spot": "PrintExp CMYK+Spot（預設）",
+                    "printexp_rgb_spot": "PrintExp RGB+Spot（廠方影片）",
                     "legacy_extrasamples": "Legacy ExtraSamples（舊輸出對照）",
                 }[x],
-                help="CMYK+Spot 同 Photoshop 印前專色 TIFF 結構一致。若仍 Invalid，改試 RGB+Spot，並檢查檔名無括號。",
+                help="只需一個白墨 Spot。CMYK+Spot 或 RGB+Spot 皆可；檔名勿含括號。",
             )
             channel_name = st.selectbox(
-                "Spot 通道名稱（廠方影片 = white）",
-                ["white", "W1", "W2", "White"],
+                "唯一 Spot 通道名稱",
+                ["white", "W1", "White"],
                 index=0,
-                help="Hoson PrintExp 廠方流程用 white；Maintop 常用 W1。",
+                help="只需一個白墨專色；廠方流程用 white。",
             )
             include_w2 = st.checkbox(
-                "同時輸出第二 Spot（varnish / W2）",
+                "額外第二 Spot（varnish／W2，通常唔使）",
                 value=False,
-                help="PrintExp 光油可選 varnish；Maintop DTF 膠層常用 W2。",
+                help="預設關閉。只需白墨時唔好開。",
             )
             dpi_override = st.number_input("DPI", min_value=72, max_value=600, value=DEFAULT_DPI)
             compression = st.radio(
@@ -1116,7 +1120,7 @@ def render_app() -> None:
         st.markdown('<div class="hairline"></div>', unsafe_allow_html=True)
         st.markdown(
             '<div class="panel-title">檢查</div>'
-            '<div class="panel-copy">拖入已做好的 TIFF 或 PNG，看通道裡有沒有 W1，避免重複製作。</div>',
+            '<div class="panel-copy">拖入 TIFF／PNG，確認是否已有唯一 white Spot。</div>',
             unsafe_allow_html=True,
         )
         inspect_upload = st.file_uploader(
@@ -1137,15 +1141,15 @@ def render_app() -> None:
     with right:
         st.markdown(
             '<div class="panel-title">通道</div>'
-            '<div class="panel-copy">與 Photoshop 相同：RGB + W1 New Spot。可切換原始覆蓋與內縮後白墨。</div>',
+            '<div class="panel-copy">唯一 white Spot。可對比「面層覆蓋（跟甩色）」與「內縮白墨（防露白）」。</div>',
             unsafe_allow_html=True,
         )
         preview_choice = st.radio(
             "白墨遮罩對比預覽",
-            options=["RGB", "white", "原始 Alpha", "內縮後白墨"],
-            index=1,
+            options=["RGB", "white", "面層覆蓋（跟甩色）", "內縮白墨（防露白）"],
+            index=0,
             horizontal=True,
-            help="W1 / 內縮後白墨 = 完整白墨底圖；應覆蓋整塊設計，不是局部做舊。",
+            help="面層覆蓋＝跟甩色的白墨來源；內縮白墨＝經 Choke 後寫入 TIFF 的唯一 Spot。",
         )
         render_channel_panel(inspect_doc or generated_doc, preview_choice)
 
