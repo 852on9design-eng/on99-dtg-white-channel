@@ -77,9 +77,30 @@ def test_safe_download_stem_strips_parens():
     assert safe_download_stem("vintage_print (12).png") == "vintage_print_12"
 
 
+def test_spot_invert_and_mirror_helpers():
+    from app import mirror_planes, spot_looks_inverted, spot_plane_for_export
+
+    rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    rgb[:, :4] = (200, 40, 40)
+    alpha = np.zeros((8, 8), dtype=np.uint8)
+    alpha[:, :4] = 255
+    coverage = alpha.copy()
+    white = alpha.copy()
+
+    rgb_m, alpha_m, coverage_m, white_m = mirror_planes(rgb, alpha, coverage, white)
+    assert alpha_m[0, 0] == 0 and alpha_m[0, 7] == 255
+    assert white_m[0, 7] == 255
+
+    exported = spot_plane_for_export(white, invert=True)
+    assert exported[0, 0] == 0 and exported[0, 7] == 255
+    assert spot_looks_inverted(exported, support=alpha)
+    assert not spot_looks_inverted(white, support=alpha)
+
+
 if __name__ == "__main__":
     test_default_cmyk_spot_named_white()
     test_rgb_spot_mode()
     test_legacy_is_not_spot()
     test_safe_download_stem_strips_parens()
+    test_spot_invert_and_mirror_helpers()
     print("OK")

@@ -33,6 +33,16 @@ Hoson PrintExp 對 TIFF 好嚴。常見失敗原因：
 2. white Color → Data Source Type = **Spot**
 3. Channel 1 = 白墨；無光油則 Channel 2 = None
 
+### 外框全白／印出來相反
+
+App 預設會 **反相寫入 Spot**（介面預覽仍係白=噴白）。  
+若 PrintEXP 外四方一圈白、或印出嚟同預覽剛相反，保持呢個選項開啟再重新匯出。
+
+### 左右鏡像
+
+DTG 直噴若衫左右相反：打開「水平鏡像」再下載。  
+DTF 轉印視乎 PrintEXP 自己有冇鏡像，唔好雙重鏡像。
+
 ## 本機測試
 
 ```bash

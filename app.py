@@ -7,6 +7,8 @@
   - 甩色破洞（透明）→ 不打白（照原圖，不補白）
   - 彩墨 **同黑墨**（含下端黑字、勾線）→ **都要打白底**
 - 再用 **Choke** 略收，避免白邊露出彩墨。
+- PrintEXP 匯出預設 **反相寫入 Spot**（避免 RIP 外框全白／印相反）。
+- 可選 **水平鏡像**（PrintEXP／轉印左右相反時開）。
 
 注意：唔好用「見黑就不打白」——會誤殺黑墨底；
 亦唔好「整塊補白」填甩色洞——會改原圖效果。
@@ -71,6 +73,54 @@ class ProcessResult:
     white: np.ndarray
     dpi: float
     source_name: str
+    mirror_horizontal: bool = False
+    spot_invert_export: bool = False
+
+
+def mirror_planes(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    coverage: np.ndarray,
+    white: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Horizontal mirror for PrintEXP / transfer orientation."""
+    return (
+        np.ascontiguousarray(np.fliplr(rgb)),
+        np.ascontiguousarray(np.fliplr(alpha)),
+        np.ascontiguousarray(np.fliplr(coverage)),
+        np.ascontiguousarray(np.fliplr(white)),
+    )
+
+
+def spot_plane_for_export(white: np.ndarray, invert: bool) -> np.ndarray:
+    """Preview keeps white=ink; PrintEXP often needs the inverted Spot plane."""
+    if not invert:
+        return white
+    return (255 - white).astype(np.uint8)
+
+
+def spot_looks_inverted(white: np.ndarray, support: np.ndarray | None = None) -> bool:
+    """Heuristic: Spot encodes ink as black (bg bright, art dark)."""
+    if white.size == 0:
+        return False
+    if support is None:
+        # Fall back to central mass vs border ring.
+        h, w = white.shape
+        band = max(1, min(h, w) // 32)
+        border = np.zeros_like(white, dtype=bool)
+        border[:band, :] = True
+        border[-band:, :] = True
+        border[:, :band] = True
+        border[:, -band:] = True
+        art = ~border
+    else:
+        art = support > 0
+        if not np.any(art) or np.all(art):
+            return False
+    bg = ~art
+    if not np.any(bg):
+        return False
+    return float(white[bg].mean()) > float(white[art].mean()) + 16.0
 
 
 @dataclass
@@ -177,10 +227,14 @@ def process_artwork(
     choke_px: int,
     polarity: ChannelPolarity,
     dpi_override: float | None = None,
+    mirror_horizontal: bool = False,
+    spot_invert_export: bool = True,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
     coverage, white = build_white_channel(alpha, choke_px, polarity)
+    if mirror_horizontal:
+        rgb, alpha, coverage, white = mirror_planes(rgb, alpha, coverage, white)
     return ProcessResult(
         rgb=rgb,
         alpha=alpha,
@@ -188,6 +242,8 @@ def process_artwork(
         white=white,
         dpi=float(dpi_override or dpi),
         source_name=filename,
+        mirror_horizontal=mirror_horizontal,
+        spot_invert_export=spot_invert_export,
     )
 
 
@@ -240,16 +296,22 @@ def write_tiff_with_white(
     include_w2: bool = False,
     export_mode: ExportMode = "printexp_cmyk_spot",
     varnish_name: str = "varnish",
+    spot_invert_export: bool = False,
 ) -> bytes:
-    """Delegate to tiff_export — PrintEXP CMYK+Spot (default) / RGB+Spot / Legacy."""
-    varnish = white.copy() if include_w2 else None
+    """Delegate to tiff_export — PrintEXP CMYK+Spot (default) / RGB+Spot / Legacy.
+
+    ``spot_invert_export`` writes an inverted Spot plane for Hoson PrintEXP builds
+    that otherwise flood white on the outer frame / print the opposite of preview.
+    """
+    export_white = spot_plane_for_export(white, spot_invert_export)
+    varnish = export_white.copy() if include_w2 else None
     if include_w2:
         second = "W2" if channel_name in {"W1", "W2"} else varnish_name
     else:
         second = varnish_name
     return write_tiff_with_spot(
         rgb,
-        white,
+        export_white,
         dpi,
         mode=export_mode,
         channel_name=channel_name,
@@ -493,6 +555,12 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
             subtitle="唯一白墨 Spot（含黑墨底）",
         )
     )
+    flags: list[str] = []
+    if result.mirror_horizontal:
+        flags.append("已水平鏡像")
+    if result.spot_invert_export:
+        flags.append("TIFF Spot 已反相寫入（PrintEXP）")
+    flag_note = ("；" + "、".join(flags)) if flags else ""
     return ChannelDocument(
         filename=result.source_name,
         width=int(result.white.shape[1]),
@@ -506,6 +574,7 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         note=(
             f"已寫入唯一 Spot「{channel_name}」。"
             "有墨位（含黑墨）打白；退地／甩色透明位不打白、不補洞；再 Choke 防露白。"
+            f"{flag_note}。"
         ),
         rgb=result.rgb,
         white=result.white,
@@ -584,12 +653,37 @@ def _inspect_tiff(file_bytes: bytes, filename: str) -> ChannelDocument:
             )
         )
 
+    invert_note = ""
+    if white_plane is not None:
+        support = None
+        if is_cmyk and samples >= 4:
+            support = data[:, :, :4].max(axis=2)
+        elif samples >= 3:
+            support = data[:, :, :3].max(axis=2)
+        if spot_looks_inverted(white_plane, support):
+            # Show ink-positive preview so check matches garment intent.
+            fixed = (255 - white_plane).astype(np.uint8)
+            white_plane = fixed
+            for i, ch in enumerate(channels):
+                if ch.is_white:
+                    channels[i] = ChannelView(
+                        name=ch.name,
+                        image=fixed,
+                        shortcut=ch.shortcut,
+                        is_white=True,
+                        is_new=ch.is_new,
+                        subtitle="白墨 Spot（檔案反相，預覽已轉回白=噴白）",
+                    )
+            invert_note = "偵測到 Spot 為反相編碼（PrintEXP 用）；預覽已轉回「白=噴白」。"
+
     if samples <= base_count:
         mode = "CMYK" if is_cmyk else "RGB"
         note = f"此 TIFF 只有 {mode}，沒有 white Spot 通道。可用左側透明 PNG 重新製作。"
         status: Literal["has_white", "missing_white"] = "missing_white"
     elif found_white:
         note = "已有唯一白墨 Spot，PrintEXP 可直接匯入。"
+        if invert_note:
+            note = invert_note + note
         status = "has_white"
     else:
         extra_label = "、".join(resolved_extras) if resolved_extras else "未命名"
@@ -981,12 +1075,23 @@ def render_app() -> None:
             value=DEFAULT_CHOKE_PX,
             help="略縮白墨，避免白邊露出彩墨。甩色圖建議 2–3。",
         )
+        spot_invert_export = st.checkbox(
+            "PrintEXP 白墨反相寫入（修外框全白／印相反）",
+            value=True,
+            help="預覽仍係「白=噴白」。寫入 TIFF 時反相 Spot，避免 PrintEXP 外四方噴白、印出嚟同預覽相反。",
+        )
+        mirror_horizontal = st.checkbox(
+            "水平鏡像（修左右相反）",
+            value=False,
+            help="DTG 直噴若衫左右相反就開。DTF 轉印視乎 PrintEXP 有冇自己鏡像。",
+        )
         with st.expander("進階"):
             polarity = st.radio(
-                "極性",
+                "極性（預覽邏輯）",
                 ["white_prints", "black_prints"],
                 format_func=lambda x: "白 = 噴白墨" if x == "white_prints" else "黑 = 噴白墨",
                 horizontal=True,
+                help="通常保持「白=噴白」。PrintEXP 相反問題請用上面「反相寫入」，唔好改呢度。",
             )
             export_mode = st.radio(
                 "匯出相容模式",
@@ -1027,6 +1132,8 @@ def render_app() -> None:
                     choke_px=int(choke_px),
                     polarity=polarity,  # type: ignore[arg-type]
                     dpi_override=float(dpi_override),
+                    mirror_horizontal=bool(mirror_horizontal),
+                    spot_invert_export=bool(spot_invert_export),
                 )
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
@@ -1038,10 +1145,11 @@ def render_app() -> None:
                     alpha=result.alpha,
                     include_w2=bool(include_w2),
                     export_mode=export_mode,  # type: ignore[arg-type]
+                    spot_invert_export=bool(result.spot_invert_export),
                 )
                 psd_bytes = write_psd_with_white(
                     result.rgb,
-                    result.white,
+                    spot_plane_for_export(result.white, bool(result.spot_invert_export)),
                     result.dpi,
                     channel_name=channel_name,
                     alpha=result.alpha,
@@ -1069,11 +1177,13 @@ def render_app() -> None:
                 st.caption(
                     f"{meta.get('color_space','?').upper()} + Spot「{channel_name}」· "
                     f"mode={export_mode} · spot={meta['is_photoshop_spot']} · "
-                    f"spp={meta['samples']} · file={stem}_{channel_name}.tif"
+                    f"spp={meta['samples']} · invert={result.spot_invert_export} · "
+                    f"mirror={result.mirror_horizontal} · file={stem}_{channel_name}.tif"
                 )
                 st.info(
                     "PrintExp：Import 呢個 .tif（檔名已去掉空格/括號）→ white Color → "
-                    "**Data Source Type = Spot**。若仍 Invalid，切換匯出模式再試，或把報錯截圖發我。"
+                    "**Data Source Type = Spot**。若仍外框全白，確認反相寫入已開；"
+                    "若左右相反，打開「水平鏡像」再下載。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
