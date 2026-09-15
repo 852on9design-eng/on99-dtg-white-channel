@@ -7,6 +7,7 @@
   - 甩色破洞（透明）→ 不打白（照原圖，不補白）
   - 彩墨 **同黑墨**（含下端黑字、勾線）→ **都要打白底**
 - 再用 **Choke** 略收，避免白邊露出彩墨。
+- 可選 **白墨水平偏移 (X)**：只移白墨通道對齊面層套準（正數往右；預設 0）。
 - PrintEXP 匯出預設 **反相寫入 Spot**（避免 RIP 外框全白／印相反）。
 - 可選 **水平鏡像**（PrintEXP／轉印左右相反時開）。
 
@@ -49,6 +50,7 @@ from tiff_export import (
 
 WHITE_CHANNEL_NAME = "white"
 DEFAULT_CHOKE_PX = 2
+DEFAULT_WHITE_X_OFFSET_PX = 0
 DEFAULT_DPI = 300
 MAX_PREVIEW_EDGE = 640
 WHITE_NAME_ALIASES = {
@@ -75,6 +77,7 @@ class ProcessResult:
     source_name: str
     mirror_horizontal: bool = False
     spot_invert_export: bool = False
+    white_x_offset_px: int = 0
 
 
 def mirror_planes(
@@ -208,14 +211,36 @@ def choke_grayscale(mask: np.ndarray, pixels: int) -> np.ndarray:
         return np.array(Image.fromarray(mask).filter(ImageFilter.MinFilter(size)))
 
 
+def offset_white_x(mask: np.ndarray, dx_px: int) -> np.ndarray:
+    """白墨水平偏移：正數往右、負數往左；超出畫布裁掉，空邊填 0（唔噴白）。"""
+    mask = np.asarray(mask, dtype=np.uint8)
+    dx = int(dx_px)
+    if dx == 0:
+        return mask
+    _h, w = mask.shape[:2]
+    out = np.zeros_like(mask)
+    if dx > 0:
+        if dx >= w:
+            return out
+        out[:, dx:] = mask[:, : w - dx]
+    else:
+        adx = -dx
+        if adx >= w:
+            return out
+        out[:, : w - adx] = mask[:, adx:]
+    return out
+
+
 def build_white_channel(
     alpha: np.ndarray,
     choke_px: int,
     polarity: ChannelPolarity,
+    white_x_offset_px: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """全圖有墨位打白（含黑墨）；甩色／退地跟 Alpha；再 choke。"""
+    """全圖有墨位打白（含黑墨）；甩色／退地跟 Alpha；再 choke；可選水平偏移。"""
     coverage = ink_coverage(alpha)
     white = choke_grayscale(coverage, choke_px)
+    white = offset_white_x(white, white_x_offset_px)
     if polarity == "black_prints":
         white = (255 - white).astype(np.uint8)
     return coverage, white
@@ -229,10 +254,16 @@ def process_artwork(
     dpi_override: float | None = None,
     mirror_horizontal: bool = False,
     spot_invert_export: bool = True,
+    white_x_offset_px: int = 0,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
-    coverage, white = build_white_channel(alpha, choke_px, polarity)
+    coverage, white = build_white_channel(
+        alpha,
+        choke_px,
+        polarity,
+        white_x_offset_px=white_x_offset_px,
+    )
     if mirror_horizontal:
         rgb, alpha, coverage, white = mirror_planes(rgb, alpha, coverage, white)
     return ProcessResult(
@@ -244,6 +275,7 @@ def process_artwork(
         source_name=filename,
         mirror_horizontal=mirror_horizontal,
         spot_invert_export=spot_invert_export,
+        white_x_offset_px=int(white_x_offset_px),
     )
 
 
@@ -556,6 +588,9 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         )
     )
     flags: list[str] = []
+    if result.white_x_offset_px:
+        direction = "往右" if result.white_x_offset_px > 0 else "往左"
+        flags.append(f"白墨水平偏移 {result.white_x_offset_px:+d} px（{direction}）")
     if result.mirror_horizontal:
         flags.append("已水平鏡像")
     if result.spot_invert_export:
@@ -1046,7 +1081,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白。</p>
+          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白；可水平微移白墨對齊面層。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1074,6 +1109,17 @@ def render_app() -> None:
             max_value=10,
             value=DEFAULT_CHOKE_PX,
             help="略縮白墨，避免白邊露出彩墨。甩色圖建議 2–3。",
+        )
+        white_x_offset_px = st.slider(
+            "白墨水平偏移 (X)",
+            min_value=-10,
+            max_value=10,
+            value=DEFAULT_WHITE_X_OFFSET_PX,
+            help=(
+                "印出來白墨偏左露鬼影時，調正數把白墨往右移對齊面層；"
+                "偏右則用負數。單位 px，上下唔使調。建議由 1–3 起微調。"
+                "負數 ← 左｜0 唔移｜右 → 正數"
+            ),
         )
         spot_invert_export = st.checkbox(
             "PrintEXP 白墨反相寫入（修外框全白／印相反）",
@@ -1134,6 +1180,7 @@ def render_app() -> None:
                     dpi_override=float(dpi_override),
                     mirror_horizontal=bool(mirror_horizontal),
                     spot_invert_export=bool(spot_invert_export),
+                    white_x_offset_px=int(white_x_offset_px),
                 )
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
@@ -1178,12 +1225,14 @@ def render_app() -> None:
                     f"{meta.get('color_space','?').upper()} + Spot「{channel_name}」· "
                     f"mode={export_mode} · spot={meta['is_photoshop_spot']} · "
                     f"spp={meta['samples']} · invert={result.spot_invert_export} · "
-                    f"mirror={result.mirror_horizontal} · file={stem}_{channel_name}.tif"
+                    f"mirror={result.mirror_horizontal} · "
+                    f"x={result.white_x_offset_px:+d}px · file={stem}_{channel_name}.tif"
                 )
                 st.info(
                     "PrintExp：Import 呢個 .tif（檔名已去掉空格/括號）→ white Color → "
                     "**Data Source Type = Spot**。若仍外框全白，確認反相寫入已開；"
-                    "若左右相反，打開「水平鏡像」再下載。"
+                    "若左右相反，打開「水平鏡像」再下載；"
+                    "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
@@ -1220,7 +1269,10 @@ def render_app() -> None:
             options=["RGB", "white", "退地／甩色覆蓋", "內縮白墨（防露白）"],
             index=0,
             horizontal=True,
-            help="覆蓋＝跟 Alpha（含黑墨、不含退地／甩色洞）；內縮＝Choke 後寫入 TIFF。",
+            help=(
+                "覆蓋＝跟 Alpha（含黑墨、不含退地／甩色洞）；"
+                "內縮＝Choke＋水平偏移後寫入 TIFF。"
+            ),
         )
         render_channel_panel(inspect_doc or generated_doc, preview_choice)
 

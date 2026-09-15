@@ -97,10 +97,37 @@ def test_spot_invert_and_mirror_helpers():
     assert not spot_looks_inverted(white, support=alpha)
 
 
+def test_offset_white_x_shifts_right_without_wrap():
+    from app import build_white_channel, offset_white_x
+
+    mask = np.zeros((6, 10), dtype=np.uint8)
+    mask[:, 2:5] = 200
+
+    right = offset_white_x(mask, 2)
+    assert np.all(right[:, :4] == 0)
+    assert np.all(right[:, 4:7] == 200)
+    assert np.all(right[:, 7:] == 0)
+
+    left = offset_white_x(mask, -2)
+    assert np.all(left[:, 0:3] == 200)
+    assert np.all(left[:, 3:] == 0)
+
+    assert np.array_equal(offset_white_x(mask, 0), mask)
+
+    alpha = np.zeros((8, 8), dtype=np.uint8)
+    alpha[2:6, 2:5] = 255
+    _coverage, white = build_white_channel(
+        alpha, choke_px=0, polarity="white_prints", white_x_offset_px=2
+    )
+    assert np.all(white[:, :4] == 0)
+    assert np.all(white[2:6, 4:7] == 255)
+
+
 if __name__ == "__main__":
     test_default_cmyk_spot_named_white()
     test_rgb_spot_mode()
     test_legacy_is_not_spot()
     test_safe_download_stem_strips_parens()
     test_spot_invert_and_mirror_helpers()
+    test_offset_white_x_shifts_right_without_wrap()
     print("OK")
