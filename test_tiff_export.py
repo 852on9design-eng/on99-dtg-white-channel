@@ -123,6 +123,25 @@ def test_offset_white_x_shifts_right_without_wrap():
     assert np.all(white[2:6, 4:7] == 255)
 
 
+def test_soften_white_bottom_only_affects_lower_tenth():
+    from app import soften_white_bottom
+
+    mask = np.full((100, 8), 200, dtype=np.uint8)
+    out = soften_white_bottom(mask, strength=10)
+    assert np.array_equal(out[:90], mask[:90])
+    assert out[99, 0] < out[90, 0] <= 200
+    assert np.array_equal(soften_white_bottom(mask, 0), mask)
+
+    alpha = np.full((100, 8), 255, dtype=np.uint8)
+    from app import build_white_channel
+
+    _c, white = build_white_channel(
+        alpha, choke_px=0, polarity="white_prints", bottom_white_fade=5
+    )
+    assert int(white[0, 0]) == 255
+    assert int(white[99, 0]) < 255
+
+
 if __name__ == "__main__":
     test_default_cmyk_spot_named_white()
     test_rgb_spot_mode()
@@ -130,4 +149,5 @@ if __name__ == "__main__":
     test_safe_download_stem_strips_parens()
     test_spot_invert_and_mirror_helpers()
     test_offset_white_x_shifts_right_without_wrap()
+    test_soften_white_bottom_only_affects_lower_tenth()
     print("OK")

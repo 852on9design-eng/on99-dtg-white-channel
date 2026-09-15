@@ -8,6 +8,7 @@
   - 彩墨 **同黑墨**（含下端黑字、勾線）→ **都要打白底**
 - 再用 **Choke** 略收，避免白邊露出彩墨。
 - 可選 **白墨水平偏移 (X)**：只移白墨通道對齊面層套準（正數往右；預設 0）。
+- 可選 **下端起步白墨減弱**：只減弱全圖最下約 1/10 區白墨濃度（噴頭剛起步露白時用；預設 0）。
 - PrintEXP 匯出預設 **反相寫入 Spot**（避免 RIP 外框全白／印相反）。
 - 可選 **水平鏡像**（PrintEXP／轉印左右相反時開）。
 
@@ -51,6 +52,8 @@ from tiff_export import (
 WHITE_CHANNEL_NAME = "white"
 DEFAULT_CHOKE_PX = 2
 DEFAULT_WHITE_X_OFFSET_PX = 0
+DEFAULT_BOTTOM_WHITE_FADE = 0
+BOTTOM_WHITE_FADE_BAND_RATIO = 0.1  # 全圖最下約 1/10
 DEFAULT_DPI = 300
 MAX_PREVIEW_EDGE = 640
 WHITE_NAME_ALIASES = {
@@ -78,6 +81,7 @@ class ProcessResult:
     mirror_horizontal: bool = False
     spot_invert_export: bool = False
     white_x_offset_px: int = 0
+    bottom_white_fade: int = 0
 
 
 def mirror_planes(
@@ -231,16 +235,41 @@ def offset_white_x(mask: np.ndarray, dx_px: int) -> np.ndarray:
     return out
 
 
+def soften_white_bottom(
+    mask: np.ndarray,
+    strength: int,
+    band_ratio: float = BOTTOM_WHITE_FADE_BAND_RATIO,
+) -> np.ndarray:
+    """下端起步白墨減弱：只處理全圖最下約 1/10；由上到下漸減濃度。strength 0=關，10=最強。"""
+    mask = np.asarray(mask, dtype=np.uint8)
+    s = int(strength)
+    if s <= 0:
+        return mask
+    h, _w = mask.shape[:2]
+    if h <= 0:
+        return mask
+    band = max(1, int(round(h * float(band_ratio))))
+    band = min(band, h)
+    # strength 1→底邊保留約 93.5%；10→底邊保留約 35%；帶頂仍 100%
+    min_keep = 1.0 - (min(s, 10) / 10.0) * 0.65
+    factors = np.linspace(1.0, min_keep, band, dtype=np.float32)
+    out = mask.astype(np.float32, copy=True)
+    out[h - band :, :] *= factors[:, None]
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
 def build_white_channel(
     alpha: np.ndarray,
     choke_px: int,
     polarity: ChannelPolarity,
     white_x_offset_px: int = 0,
+    bottom_white_fade: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """全圖有墨位打白（含黑墨）；甩色／退地跟 Alpha；再 choke；可選水平偏移。"""
+    """全圖有墨位打白（含黑墨）；甩色／退地跟 Alpha；再 choke；可選水平偏移／下端減弱。"""
     coverage = ink_coverage(alpha)
     white = choke_grayscale(coverage, choke_px)
     white = offset_white_x(white, white_x_offset_px)
+    white = soften_white_bottom(white, bottom_white_fade)
     if polarity == "black_prints":
         white = (255 - white).astype(np.uint8)
     return coverage, white
@@ -255,6 +284,7 @@ def process_artwork(
     mirror_horizontal: bool = False,
     spot_invert_export: bool = True,
     white_x_offset_px: int = 0,
+    bottom_white_fade: int = 0,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
@@ -263,6 +293,7 @@ def process_artwork(
         choke_px,
         polarity,
         white_x_offset_px=white_x_offset_px,
+        bottom_white_fade=bottom_white_fade,
     )
     if mirror_horizontal:
         rgb, alpha, coverage, white = mirror_planes(rgb, alpha, coverage, white)
@@ -276,6 +307,7 @@ def process_artwork(
         mirror_horizontal=mirror_horizontal,
         spot_invert_export=spot_invert_export,
         white_x_offset_px=int(white_x_offset_px),
+        bottom_white_fade=int(bottom_white_fade),
     )
 
 
@@ -591,6 +623,8 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
     if result.white_x_offset_px:
         direction = "往右" if result.white_x_offset_px > 0 else "往左"
         flags.append(f"白墨水平偏移 {result.white_x_offset_px:+d} px（{direction}）")
+    if result.bottom_white_fade:
+        flags.append(f"下端起步白墨減弱 {result.bottom_white_fade}/10（最下約 1/10）")
     if result.mirror_horizontal:
         flags.append("已水平鏡像")
     if result.spot_invert_export:
@@ -1081,7 +1115,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白；可水平微移白墨對齊面層。</p>
+          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白；可水平微移白墨，亦可減弱下端起步區白墨。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1119,6 +1153,17 @@ def render_app() -> None:
                 "印出來白墨偏左露鬼影時，調正數把白墨往右移對齊面層；"
                 "偏右則用負數。單位 px，上下唔使調。建議由 1–3 起微調。"
                 "負數 ← 左｜0 唔移｜右 → 正數"
+            ),
+        )
+        bottom_white_fade = st.slider(
+            "下端起步白墨減弱",
+            min_value=0,
+            max_value=10,
+            value=DEFAULT_BOTTOM_WHITE_FADE,
+            help=(
+                "噴頭剛起步彩墨未穩、下端字／色棒透白時開。"
+                "只減弱全圖最下約 1/10 區白墨濃度（由帶頂正常 → 底邊漸弱）；"
+                "上半圖唔變。0＝唔減，建議 3–6。"
             ),
         )
         spot_invert_export = st.checkbox(
@@ -1181,6 +1226,7 @@ def render_app() -> None:
                     mirror_horizontal=bool(mirror_horizontal),
                     spot_invert_export=bool(spot_invert_export),
                     white_x_offset_px=int(white_x_offset_px),
+                    bottom_white_fade=int(bottom_white_fade),
                 )
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
@@ -1226,13 +1272,16 @@ def render_app() -> None:
                     f"mode={export_mode} · spot={meta['is_photoshop_spot']} · "
                     f"spp={meta['samples']} · invert={result.spot_invert_export} · "
                     f"mirror={result.mirror_horizontal} · "
-                    f"x={result.white_x_offset_px:+d}px · file={stem}_{channel_name}.tif"
+                    f"x={result.white_x_offset_px:+d}px · "
+                    f"bottomFade={result.bottom_white_fade}/10 · "
+                    f"file={stem}_{channel_name}.tif"
                 )
                 st.info(
                     "PrintExp：Import 呢個 .tif（檔名已去掉空格/括號）→ white Color → "
                     "**Data Source Type = Spot**。若仍外框全白，確認反相寫入已開；"
                     "若左右相反，打開「水平鏡像」再下載；"
-                    "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載。"
+                    "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
+                    "若下端起步透白，用「下端起步白墨減弱」再下載。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
@@ -1271,7 +1320,7 @@ def render_app() -> None:
             horizontal=True,
             help=(
                 "覆蓋＝跟 Alpha（含黑墨、不含退地／甩色洞）；"
-                "內縮＝Choke＋水平偏移後寫入 TIFF。"
+                "內縮＝Choke＋水平偏移＋下端減弱後寫入 TIFF。"
             ),
         )
         render_channel_panel(inspect_doc or generated_doc, preview_choice)
