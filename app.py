@@ -9,6 +9,7 @@
 - 再用 **Choke** 略收，避免白邊露出彩墨。
 - 可選 **白墨水平偏移 (X)**：只移白墨通道對齊面層套準（正數往右；預設 0）。
 - 可選 **下端起步白墨減弱**：只減弱全圖最下約 1/10 區白墨濃度（噴頭剛起步露白時用；預設 0）。
+- 可選 **底部廢墨條 (Lead-in Bar)**：圖案正下方置中加 4×1 cm 通墨條（預設關；自動加高畫布）。
 - PrintEXP 匯出預設 **反相寫入 Spot**（避免 RIP 外框全白／印相反）。
 - 可選 **水平鏡像**（PrintEXP／轉印左右相反時開）。
 
@@ -54,6 +55,17 @@ DEFAULT_CHOKE_PX = 2
 DEFAULT_WHITE_X_OFFSET_PX = 0
 DEFAULT_BOTTOM_WHITE_FADE = 0
 BOTTOM_WHITE_FADE_BAND_RATIO = 0.1  # 全圖最下約 1/10
+DEFAULT_LEAD_IN_BAR = False
+LEAD_IN_GAP_MM = 3.0
+LEAD_IN_WIDTH_MM = 40.0  # 4 cm
+LEAD_IN_HEIGHT_MM = 10.0  # 1 cm
+# RGB 近似 C/M/Y/K，匯出 CMYK 時四色噴頭都會出墨
+LEAD_IN_SEGMENT_RGB = (
+    (0, 174, 239),    # C
+    (236, 0, 140),    # M
+    (255, 242, 0),    # Y
+    (0, 0, 0),        # K
+)
 DEFAULT_DPI = 300
 MAX_PREVIEW_EDGE = 640
 WHITE_NAME_ALIASES = {
@@ -82,6 +94,7 @@ class ProcessResult:
     spot_invert_export: bool = False
     white_x_offset_px: int = 0
     bottom_white_fade: int = 0
+    lead_in_bar: bool = False
 
 
 def mirror_planes(
@@ -258,6 +271,100 @@ def soften_white_bottom(
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
+def mm_to_px(mm: float, dpi: float) -> int:
+    """Millimetres → pixels at given DPI (minimum 1)."""
+    return max(1, int(round(float(mm) / 25.4 * float(dpi))))
+
+
+def content_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Return inclusive (x0, y0, x1, y1) of opaque content, or None if empty."""
+    ys, xs = np.where(np.asarray(alpha) > 0)
+    if xs.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def apply_lead_in_bar(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    coverage: np.ndarray,
+    white: np.ndarray,
+    dpi: float,
+    polarity: ChannelPolarity = "white_prints",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """在圖案正下方置中加 4×1 cm 廢墨條（距內容底邊 3mm）；不足則向下／向左右延伸畫布。
+
+    彩墨為 C/M/Y/K 四段實色；白墨為 100% 噴白（跟 polarity）。
+    於 choke／偏移／下端減弱之後套用，避免廢墨條被削弱。
+    """
+    bbox = content_bbox(alpha)
+    if bbox is None:
+        return rgb, alpha, coverage, white
+
+    x0, _y0, x1, y1 = bbox
+    gap = mm_to_px(LEAD_IN_GAP_MM, dpi)
+    bar_w = mm_to_px(LEAD_IN_WIDTH_MM, dpi)
+    bar_h = mm_to_px(LEAD_IN_HEIGHT_MM, dpi)
+
+    content_cx = (x0 + x1 + 1) / 2.0
+    bar_left = int(round(content_cx - bar_w / 2.0))
+    bar_top = int(y1 + 1 + gap)
+    bar_right = bar_left + bar_w
+    bar_bottom = bar_top + bar_h
+
+    h, w = alpha.shape
+    pad_left = max(0, -bar_left)
+    pad_right = max(0, bar_right - w)
+    pad_bottom = max(0, bar_bottom - h)
+
+    if pad_left or pad_right or pad_bottom:
+        new_h = h + pad_bottom
+        new_w = w + pad_left + pad_right
+        rgb_n = np.zeros((new_h, new_w, 3), dtype=np.uint8)
+        alpha_n = np.zeros((new_h, new_w), dtype=np.uint8)
+        coverage_n = np.zeros((new_h, new_w), dtype=np.uint8)
+        # 透明底：white_prints=0；black_prints=255（唔噴白）
+        white_n = np.full(
+            (new_h, new_w),
+            255 if polarity == "black_prints" else 0,
+            dtype=np.uint8,
+        )
+        rgb_n[:h, pad_left : pad_left + w] = rgb
+        alpha_n[:h, pad_left : pad_left + w] = alpha
+        coverage_n[:h, pad_left : pad_left + w] = coverage
+        white_n[:h, pad_left : pad_left + w] = white
+        rgb, alpha, coverage, white = rgb_n, alpha_n, coverage_n, white_n
+        bar_left += pad_left
+        bar_right += pad_left
+
+    h, w = alpha.shape
+    bl = max(0, bar_left)
+    bt = max(0, bar_top)
+    br = min(w, bar_right)
+    bb = min(h, bar_bottom)
+    if br <= bl or bb <= bt:
+        return rgb, alpha, coverage, white
+
+    white_ink = 0 if polarity == "black_prints" else 255
+    span = br - bl
+    for i, color in enumerate(LEAD_IN_SEGMENT_RGB):
+        sx = bl + (i * span) // 4
+        ex = bl + ((i + 1) * span) // 4
+        if ex <= sx:
+            continue
+        rgb[bt:bb, sx:ex] = color
+        alpha[bt:bb, sx:ex] = 255
+        coverage[bt:bb, sx:ex] = 255
+        white[bt:bb, sx:ex] = white_ink
+
+    return (
+        np.ascontiguousarray(rgb),
+        np.ascontiguousarray(alpha),
+        np.ascontiguousarray(coverage),
+        np.ascontiguousarray(white),
+    )
+
+
 def build_white_channel(
     alpha: np.ndarray,
     choke_px: int,
@@ -285,6 +392,7 @@ def process_artwork(
     spot_invert_export: bool = True,
     white_x_offset_px: int = 0,
     bottom_white_fade: int = 0,
+    lead_in_bar: bool = False,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
@@ -297,17 +405,28 @@ def process_artwork(
     )
     if mirror_horizontal:
         rgb, alpha, coverage, white = mirror_planes(rgb, alpha, coverage, white)
+    out_dpi = float(dpi_override or dpi)
+    if lead_in_bar:
+        rgb, alpha, coverage, white = apply_lead_in_bar(
+            rgb,
+            alpha,
+            coverage,
+            white,
+            dpi=out_dpi,
+            polarity=polarity,
+        )
     return ProcessResult(
         rgb=rgb,
         alpha=alpha,
         coverage=coverage,
         white=white,
-        dpi=float(dpi_override or dpi),
+        dpi=out_dpi,
         source_name=filename,
         mirror_horizontal=mirror_horizontal,
         spot_invert_export=spot_invert_export,
         white_x_offset_px=int(white_x_offset_px),
         bottom_white_fade=int(bottom_white_fade),
+        lead_in_bar=bool(lead_in_bar),
     )
 
 
@@ -625,6 +744,8 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         flags.append(f"白墨水平偏移 {result.white_x_offset_px:+d} px（{direction}）")
     if result.bottom_white_fade:
         flags.append(f"下端起步白墨減弱 {result.bottom_white_fade}/10（最下約 1/10）")
+    if result.lead_in_bar:
+        flags.append("已加底部廢墨條（Lead-in，圖案正下方置中）")
     if result.mirror_horizontal:
         flags.append("已水平鏡像")
     if result.spot_invert_export:
@@ -1115,7 +1236,7 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白；可水平微移白墨，亦可減弱下端起步區白墨。</p>
+          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白；可水平微移、減弱下端白墨，亦可加底部廢墨條通墨。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1164,6 +1285,14 @@ def render_app() -> None:
                 "噴頭剛起步彩墨未穩、下端字／色棒透白時開。"
                 "只減弱全圖最下約 1/10 區白墨濃度（由帶頂正常 → 底邊漸弱）；"
                 "上半圖唔變。0＝唔減，建議 3–6。"
+            ),
+        )
+        lead_in_bar = st.checkbox(
+            "啟用底部廢墨條 (Lead-in Bar)",
+            value=DEFAULT_LEAD_IN_BAR,
+            help=(
+                "喺圖案內容最底邊再下 3mm，置中加 4cm×1cm 廢墨條（C/M/Y/K 四段＋100% 白底），"
+                "幫噴頭起步打通墨路。會自動加高畫布，預設關閉。"
             ),
         )
         spot_invert_export = st.checkbox(
@@ -1227,6 +1356,7 @@ def render_app() -> None:
                     spot_invert_export=bool(spot_invert_export),
                     white_x_offset_px=int(white_x_offset_px),
                     bottom_white_fade=int(bottom_white_fade),
+                    lead_in_bar=bool(lead_in_bar),
                 )
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
@@ -1274,6 +1404,7 @@ def render_app() -> None:
                     f"mirror={result.mirror_horizontal} · "
                     f"x={result.white_x_offset_px:+d}px · "
                     f"bottomFade={result.bottom_white_fade}/10 · "
+                    f"leadIn={result.lead_in_bar} · "
                     f"file={stem}_{channel_name}.tif"
                 )
                 st.info(
@@ -1281,7 +1412,8 @@ def render_app() -> None:
                     "**Data Source Type = Spot**。若仍外框全白，確認反相寫入已開；"
                     "若左右相反，打開「水平鏡像」再下載；"
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
-                    "若下端起步透白，用「下端起步白墨減弱」再下載。"
+                    "若下端起步透白，用「下端起步白墨減弱」；"
+                    "若要通墨，勾「啟用底部廢墨條」再下載。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
