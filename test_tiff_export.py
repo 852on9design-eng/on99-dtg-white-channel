@@ -192,7 +192,10 @@ def test_guides_x_on_graphic_height_on_color_block():
     alpha[cy0 : cy1 + 1, cx0 : cx1 + 1] = 255
 
     detected = color_block_bbox(rgb, alpha)
-    assert detected == (cx0, cy0, cx1, cy1), detected
+    assert detected is not None, detected
+    dx0, dy0, dx1, dy1 = detected
+    assert abs(dx0 - cx0) <= 4 and abs(dy0 - cy0) <= 4
+    assert abs(dx1 - cx1) <= 4 and abs(dy1 - cy1) <= 4
 
     coverage = alpha.copy()
     white = alpha.copy()
@@ -233,7 +236,7 @@ def test_guides_x_on_graphic_height_on_color_block():
 
     assert int(alpha2[by0, left_x + arm - 1]) == 255
     assert int(alpha2[by0, right_x - arm + 1]) == 255
-    assert int(white2[by0, left_x]) == 0
+    assert int(white2[by0, left_x]) == 255  # white underbase for RIP / mask tape
     assert tuple(int(v) for v in rgb2[by0, left_x]) == (0, 0, 0)
     cmyk = rgb_alpha_to_cmyk(rgb2, alpha2)
     assert int(cmyk[by0, left_x, 3]) > 200
@@ -247,13 +250,11 @@ def test_color_block_detects_solid_grey_ignores_distress():
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
     alpha = np.zeros((h, w), dtype=np.uint8)
 
-    # Distressed-like noisy chromatic blob (should NOT win)
     rng = np.random.default_rng(0)
     alpha[5:70, 5:115] = 255
     noise = rng.integers(40, 220, size=(65, 110, 3), dtype=np.uint8)
     rgb[5:70, 5:115] = noise
 
-    # Solid grey Color Block at bottom (should be selected)
     rgb[78:92, 40:80] = (160, 160, 160)
     alpha[78:92, 40:80] = 255
 
@@ -262,6 +263,24 @@ def test_color_block_detects_solid_grey_ignores_distress():
     x0, y0, x1, y1 = box
     assert y0 >= 78 and y1 <= 91
     assert x0 >= 40 and x1 <= 79
+
+
+def test_white_color_block_under_distress_is_detected():
+    from app import color_block_bbox
+
+    h, w = 100, 120
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    rng = np.random.default_rng(1)
+    alpha[5:70, 5:115] = 255
+    rgb[5:70, 5:115] = rng.integers(40, 220, size=(65, 110, 3), dtype=np.uint8)
+    rgb[78:92, 35:85] = (255, 255, 255)
+    alpha[78:92, 35:85] = 255
+    box = color_block_bbox(rgb, alpha)
+    assert box is not None, box
+    x0, y0, x1, y1 = box
+    assert y0 >= 77 and y1 <= 92
+    assert x0 >= 34 and x1 <= 85
 
 
 def test_white_only_art_no_guides():
@@ -294,5 +313,6 @@ if __name__ == "__main__":
     test_lead_in_bar_centered_expands_canvas()
     test_guides_x_on_graphic_height_on_color_block()
     test_color_block_detects_solid_grey_ignores_distress()
+    test_white_color_block_under_distress_is_detected()
     test_white_only_art_no_guides()
     print("OK")
