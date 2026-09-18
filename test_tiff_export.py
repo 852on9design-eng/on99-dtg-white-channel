@@ -302,6 +302,101 @@ def test_white_only_art_no_guides():
     assert int(alpha2.sum()) == int(alpha.sum())
 
 
+def test_red_marks_x_on_graphic_y_on_color_block_top():
+    """X = 大圖案外側 1cm；Y = Color Block 頂。無色塊唔畫。唔畫高過色塊頂。"""
+    from app import (
+        GUIDE_OFFSET_MM,
+        GUIDE_STROKE_PX,
+        RED_MARK_LENGTH_MM,
+        RED_MARK_RGB,
+        apply_red_top_marks,
+        color_block_bbox,
+        mm_to_px,
+    )
+
+    dpi = 300.0
+    offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
+    length = mm_to_px(RED_MARK_LENGTH_MM, dpi)
+    stroke = max(1, int(GUIDE_STROKE_PX))
+    assert GUIDE_OFFSET_MM == 10.0
+    assert RED_MARK_LENGTH_MM == 10.0
+    assert RED_MARK_RGB == (255, 0, 0)
+
+    h, w = 160, 200
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+
+    gx0, gy0, gx1, gy1 = 10, 10, 189, 140
+    alpha[gy0 : gy1 + 1, gx0 : gx1 + 1] = 255
+    rgb[gy0 : gy1 + 1, gx0 : gx1 + 1] = (255, 255, 255)
+
+    cx0, cy0, cx1, cy1 = 70, 50, 129, 99
+    rgb[cy0 : cy1 + 1, cx0 : cx1 + 1] = (180, 60, 60)
+    alpha[cy0 : cy1 + 1, cx0 : cx1 + 1] = 255
+
+    detected = color_block_bbox(rgb, alpha)
+    assert detected is not None, detected
+
+    coverage = alpha.copy()
+    white = alpha.copy()
+    rgb2, alpha2, _c2, white2, graphic2, color2 = apply_red_top_marks(
+        rgb,
+        alpha,
+        coverage,
+        white,
+        dpi=dpi,
+        polarity="white_prints",
+        graphic_box=(gx0, gy0, gx1, gy1),
+        color_block_box=(cx0, cy0, cx1, cy1),
+    )
+    assert graphic2 is not None and color2 is not None
+    g2x0, _g2y0, g2x1, _g2y1 = graphic2
+    _bx0, by0, _bx1, by1 = color2
+    assert by0 == cy0
+    assert by1 == cy1
+
+    left_x = g2x0 - offset
+    right_x = g2x1 + offset
+    # X follows graphic, NOT color block
+    assert left_x == g2x0 - offset
+    assert right_x == g2x1 + offset
+
+    # Y = Color Block top only; stroke sits on top edge, not above it
+    assert tuple(int(v) for v in rgb2[by0, left_x]) == (255, 0, 0)
+    assert tuple(int(v) for v in rgb2[by0, left_x + length - 1]) == (255, 0, 0)
+    assert tuple(int(v) for v in rgb2[by0, right_x]) == (255, 0, 0)
+    assert tuple(int(v) for v in rgb2[by0, right_x - length + 1]) == (255, 0, 0)
+    assert int(white2[by0, left_x]) == 255
+    if by0 > 0:
+        assert int(alpha2[by0 - 1, left_x]) == 0
+        assert int(alpha2[by0 - 1, right_x]) == 0
+    # Must not follow graphic top, and not paint the color-block bottom as a mark
+    assert by0 > graphic2[1]
+    assert tuple(int(v) for v in rgb2[by1, left_x]) != (255, 0, 0)
+    if by0 + stroke < alpha2.shape[0]:
+        # inward 1cm is red at top; below the stroke at outer X should stay empty
+        assert int(alpha2[by0 + stroke, left_x]) == 0
+
+
+def test_white_only_art_no_red_marks():
+    from app import apply_red_top_marks, color_block_bbox
+
+    h, w = 80, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    alpha[10:70, 10:90] = 255
+    rgb[10:70, 10:90] = (255, 255, 255)
+    assert color_block_bbox(rgb, alpha) is None
+
+    rgb2, alpha2, _c, _w, g2, c2 = apply_red_top_marks(
+        rgb, alpha, alpha.copy(), alpha.copy(), dpi=300.0
+    )
+    assert c2 is None
+    assert g2 == (10, 10, 89, 69)
+    assert np.array_equal(rgb2, rgb)
+    assert int(alpha2.sum()) == int(alpha.sum())
+
+
 if __name__ == "__main__":
     test_default_cmyk_spot_named_white()
     test_rgb_spot_mode()
@@ -315,4 +410,6 @@ if __name__ == "__main__":
     test_color_block_detects_solid_grey_ignores_distress()
     test_white_color_block_under_distress_is_detected()
     test_white_only_art_no_guides()
+    test_red_marks_x_on_graphic_y_on_color_block_top()
+    test_white_only_art_no_red_marks()
     print("OK")
