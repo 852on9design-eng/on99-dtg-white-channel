@@ -10,7 +10,7 @@
 - 可選 **白墨水平偏移 (X)**：只移白墨通道對齊面層套準（正數往右；預設 0）。
 - 可選 **下端起步白墨減弱**：只減弱全圖最下約 1/10 區白墨濃度（噴頭剛起步露白時用；預設 0）。
 - 可選 **底部廢墨條 (Lead-in Bar)**：圖案正下方置中加 4×1 cm 通墨條（預設關；自動加高畫布）。
-- 可選 **紅標橫線**：大圖案左右外側 1cm 各畫約 1cm 紅橫，高度對齊 Color Block 頂（預設關）。
+- 可選 **定位線 [ ]／紅標橫線**：X=大圖案外側 1cm；高度跟底部 C/M/Y/K Color Block（廢墨條）。
 - PrintEXP 匯出預設 **反相寫入 Spot**（避免 RIP 外框全白／印相反）。
 - 可選 **水平鏡像**（PrintEXP／轉印左右相反時開）。
 
@@ -499,9 +499,9 @@ def apply_registration_guides(
     """大圖案左右外側 1cm 畫 [ ] 定位括號（K100% + 白底，無頂部黑條）。
 
     - 左右 X：圖案最左／最右外側 1cm（GUIDE_OFFSET_MM）
-    - 豎段高度 Y：對齊 Color Block 頂～底（唔跟圖案總高）
+    - 豎段高度 Y：對齊 Color Block 頂～底（底部 C/M/Y/K 色條；唔跟圖案總高）
     - 上下短橫朝內 GUIDE_ARM_MM；線寬 GUIDE_STROKE_PX
-    - 偵測唔到 Color Block → 唔畫（唔改用圖案高）
+    - 冇 Color Block → 唔畫（唔改用圖案高）
     回傳 (planes..., graphic_box', color_block_box'|None)。
     """
     graphic = graphic_box if graphic_box is not None else graphic_bbox(alpha)
@@ -583,12 +583,12 @@ def apply_red_top_marks(
     tuple[int, int, int, int] | None,
     tuple[int, int, int, int] | None,
 ]:
-    """大圖案左右外側 1cm 各畫約 1cm 紅橫線，Y 對齊 Color Block 頂。
+    """大圖案左右外側 1cm 各畫約 1cm 紅橫線，Y 對齊底部 C/M/Y/K Color Block 頂。
 
     - 左右 X：圖案最左／最右外側 1cm（GUIDE_OFFSET_MM），橫線朝內 RED_MARK_LENGTH_MM
-    - 高度 Y：對齊 Color Block 頂邊（唔跟圖案頂；唔畫高過色塊頂）
+    - 高度 Y：對齊 Color Block 頂邊（底部 C/M/Y/K 色條頂，唔跟圖案頂）
     - 線寬 GUIDE_STROKE_PX；紅墨 + 100% 白底
-    - 偵測唔到 Color Block → 唔畫
+    - 冇 Color Block → 唔畫
     回傳 (planes..., graphic_box', color_block_box'|None)。
     """
     graphic = graphic_box if graphic_box is not None else graphic_bbox(alpha)
@@ -643,16 +643,24 @@ def apply_lead_in_bar(
     dpi: float,
     polarity: ChannelPolarity = "white_prints",
     content_box: tuple[int, int, int, int] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[int, int, int, int] | None,
+    int,
+]:
     """在圖案正下方置中加 4×1 cm 廢墨條（距內容底邊 3mm）；不足則向下／向左右延伸畫布。
 
     彩墨為 C/M/Y/K 四段實色；白墨為 100% 噴白（跟 polarity）。
     於 choke／偏移／下端減弱之後套用，避免廢墨條被削弱。
     content_box：若已加定位線，傳入圖案内容 bbox，避免把標記算進內容範圍。
+    回傳 (planes..., bar_box|None, pad_left)。bar_box 係 C/M/Y/K Color Block 外框。
     """
     bbox = content_box if content_box is not None else content_bbox(alpha)
     if bbox is None:
-        return rgb, alpha, coverage, white
+        return rgb, alpha, coverage, white, None, 0
 
     x0, _y0, x1, y1 = bbox
     gap = mm_to_px(LEAD_IN_GAP_MM, dpi)
@@ -696,7 +704,7 @@ def apply_lead_in_bar(
     br = min(w, bar_right)
     bb = min(h, bar_bottom)
     if br <= bl or bb <= bt:
-        return rgb, alpha, coverage, white
+        return rgb, alpha, coverage, white, None, pad_left
 
     white_ink = 0 if polarity == "black_prints" else 255
     span = br - bl
@@ -710,11 +718,14 @@ def apply_lead_in_bar(
         coverage[bt:bb, sx:ex] = 255
         white[bt:bb, sx:ex] = white_ink
 
+    bar_box = (bl, bt, br - 1, bb - 1)
     return (
         np.ascontiguousarray(rgb),
         np.ascontiguousarray(alpha),
         np.ascontiguousarray(coverage),
         np.ascontiguousarray(white),
+        bar_box,
+        pad_left,
     )
 
 
@@ -765,32 +776,9 @@ def process_artwork(
     color_block = color_block_bbox(rgb, alpha)
     guides_applied = False
     red_applied = False
-    if registration_guides and color_block is not None:
-        rgb, alpha, coverage, white, graphic, color_block = apply_registration_guides(
-            rgb,
-            alpha,
-            coverage,
-            white,
-            dpi=out_dpi,
-            polarity=polarity,
-            graphic_box=graphic,
-            color_block_box=color_block,
-        )
-        guides_applied = color_block is not None
-    if red_top_marks and color_block is not None:
-        rgb, alpha, coverage, white, graphic, color_block = apply_red_top_marks(
-            rgb,
-            alpha,
-            coverage,
-            white,
-            dpi=out_dpi,
-            polarity=polarity,
-            graphic_box=graphic,
-            color_block_box=color_block,
-        )
-        red_applied = color_block is not None
+    lead_box: tuple[int, int, int, int] | None = None
     if lead_in_bar:
-        rgb, alpha, coverage, white = apply_lead_in_bar(
+        rgb, alpha, coverage, white, lead_box, pad_left = apply_lead_in_bar(
             rgb,
             alpha,
             coverage,
@@ -799,6 +787,39 @@ def process_artwork(
             polarity=polarity,
             content_box=graphic,
         )
+        if pad_left:
+            if graphic is not None:
+                gx0, gy0, gx1, gy1 = graphic
+                graphic = (gx0 + pad_left, gy0, gx1 + pad_left, gy1)
+            if color_block is not None:
+                cx0, cy0, cx1, cy1 = color_block
+                color_block = (cx0 + pad_left, cy0, cx1 + pad_left, cy1)
+    # Color Block = 底部 C/M/Y/K 色條（廢墨條）；定位線同紅標共用
+    block = lead_box if lead_box is not None else color_block
+    if registration_guides and block is not None:
+        rgb, alpha, coverage, white, graphic, block = apply_registration_guides(
+            rgb,
+            alpha,
+            coverage,
+            white,
+            dpi=out_dpi,
+            polarity=polarity,
+            graphic_box=graphic,
+            color_block_box=block,
+        )
+        guides_applied = block is not None
+    if red_top_marks and block is not None:
+        rgb, alpha, coverage, white, graphic, block = apply_red_top_marks(
+            rgb,
+            alpha,
+            coverage,
+            white,
+            dpi=out_dpi,
+            polarity=polarity,
+            graphic_box=graphic,
+            color_block_box=block,
+        )
+        red_applied = block is not None
     return ProcessResult(
         rgb=rgb,
         alpha=alpha,
@@ -1133,11 +1154,11 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         flags.append("已加底部廢墨條（Lead-in，圖案正下方置中）")
     if result.registration_guides:
         flags.append(
-            "已加左右 [ ] 定位線（X=圖案外側 1cm；豎段=Color Block；K100+白底；短橫 4mm）"
+            "已加左右 [ ] 定位線（X=圖案外側 1cm；豎段=底部 C/M/Y/K Color Block；K100+白底；短橫 4mm）"
         )
     if result.red_top_marks:
         flags.append(
-            "已加左右紅標橫線（X=圖案外側 1cm；Y=Color Block 頂；約 1cm；紅墨+白底）"
+            "已加左右紅標橫線（X=圖案外側 1cm；Y=底部 C/M/Y/K Color Block 頂；約 1cm；紅墨+白底）"
         )
     if result.mirror_horizontal:
         flags.append("已水平鏡像")
@@ -1693,9 +1714,9 @@ def render_app() -> None:
             value=DEFAULT_REGISTRATION_GUIDES,
             help=(
                 "大圖案左右外側 1cm 畫 [ ]："
-                "豎段=Color Block 高；短橫 4mm；線寬 2px。"
+                "豎段=底部 C/M/Y/K Color Block 高（廢墨條頂～底）；短橫 4mm；線寬 2px。"
                 "黑墨 K100% + 白通道 100%，方便 RIP 對位同貼 mask tape。"
-                "有實心 Color Block 先畫（豎段=色塊高）；冇色塊就唔畫，唔會改跟圖案高。"
+                "有色條先畫；冇就不畫，唔會改跟圖案高。"
             ),
         )
         red_top_marks = st.checkbox(
@@ -1703,8 +1724,8 @@ def render_app() -> None:
             value=DEFAULT_RED_TOP_MARKS,
             help=(
                 "大圖案左右外側 1cm 各畫約 1cm 紅橫線（朝內；線寬 2px）。"
-                "高度對齊 Color Block 頂邊，唔跟圖案頂。"
-                "紅墨 + 白通道 100%。有 Color Block 先畫；冇就不畫。"
+                "高度對齊底部 C/M/Y/K Color Block 頂（廢墨條頂邊），唔跟圖案頂。"
+                "紅墨 + 白通道 100%。有色條先畫；冇就不畫。"
             ),
         )
         spot_invert_export = st.checkbox(
@@ -1824,9 +1845,15 @@ def render_app() -> None:
                     f"file={stem}_{channel_name}.tif"
                 )
                 if registration_guides and not result.registration_guides:
-                    st.warning("未偵測到 Color Block，冇畫定位線（唔會改用圖案高度）。")
+                    st.warning(
+                        "未偵測到 Color Block（底部 C/M/Y/K 色條）。"
+                        "勾「啟用底部廢墨條」或原圖要有色條先畫定位線。"
+                    )
                 if red_top_marks and not result.red_top_marks:
-                    st.warning("未偵測到 Color Block，冇畫紅標橫線。")
+                    st.warning(
+                        "未偵測到 Color Block（底部 C/M/Y/K 色條）。"
+                        "勾「啟用底部廢墨條」或原圖要有色條先畫紅標。"
+                    )
                 st.info(
                     "PrintExp：Import 呢個 .tif（檔名已去掉空格/括號）→ white Color → "
                     "**Data Source Type = Spot**。若仍外框全白，確認反相寫入已開；"
@@ -1834,8 +1861,7 @@ def render_app() -> None:
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
                     "若下端起步透白，用「下端起步白墨減弱」；"
                     "若要通墨，勾「啟用底部廢墨條」再下載；"
-                    "定位線：有 Color Block 先畫黑 [ ] + 白底（外側 1cm；高度=色塊）。"
-                    "紅標：有 Color Block 先畫左右紅橫（外側 1cm；Y=色塊頂）。"
+                    "定位線／紅標：都跟底部 C/M/Y/K 色條（外側 1cm；[ ] 豎段=色條高；紅橫=色條頂）。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")

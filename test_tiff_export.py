@@ -131,7 +131,7 @@ def test_lead_in_bar_centered_expands_canvas():
     coverage = alpha.copy()
     white = alpha.copy()
 
-    rgb2, alpha2, coverage2, white2 = apply_lead_in_bar(
+    rgb2, alpha2, coverage2, white2, bar_box, _pad = apply_lead_in_bar(
         rgb, alpha, coverage, white, dpi=dpi, polarity="white_prints"
     )
     gap = mm_to_px(LEAD_IN_GAP_MM, dpi)
@@ -156,6 +156,109 @@ def test_lead_in_bar_centered_expands_canvas():
     assert bar_slice[:, :, 2].max() > 0
     assert bar_slice[:, :, 3].max() > 0
     assert bar_w >= 100
+    assert bar_box is not None
+    assert bar_box[1] == bar_top
+
+
+def test_red_marks_follow_lead_in_cmyk_block():
+    """Color Block = 底部 C/M/Y/K 廢墨條；紅標 Y = 色條頂，X = 圖案外側 1cm。"""
+    from app import (
+        GUIDE_OFFSET_MM,
+        RED_MARK_LENGTH_MM,
+        apply_lead_in_bar,
+        apply_red_top_marks,
+        mm_to_px,
+        process_artwork,
+    )
+    from PIL import Image
+    import io
+
+    dpi = 300.0
+    h, w = 80, 160
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    gx0, gy0, gx1, gy1 = 20, 10, 139, 59
+    alpha[gy0 : gy1 + 1, gx0 : gx1 + 1] = 255
+    rgb[gy0 : gy1 + 1, gx0 : gx1 + 1] = (200, 200, 200)
+
+    rgb2, alpha2, cov2, white2, bar_box, pad_left = apply_lead_in_bar(
+        rgb, alpha, alpha.copy(), alpha.copy(), dpi=dpi, polarity="white_prints",
+        content_box=(gx0, gy0, gx1, gy1),
+    )
+    assert bar_box is not None
+    gx0p, gx1p = gx0 + pad_left, gx1 + pad_left
+    rgb3, alpha3, _c3, white3, graphic3, color3 = apply_red_top_marks(
+        rgb2, alpha2, cov2, white2, dpi=dpi, polarity="white_prints",
+        graphic_box=(gx0p, gy0, gx1p, gy1),
+        color_block_box=bar_box,
+    )
+    assert graphic3 is not None and color3 is not None
+    offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
+    length = mm_to_px(RED_MARK_LENGTH_MM, dpi)
+    left_x = graphic3[0] - offset
+    by0 = color3[1]
+    assert by0 == bar_box[1]
+    assert tuple(int(v) for v in rgb3[by0, left_x]) == (255, 0, 0)
+    assert tuple(int(v) for v in rgb3[by0, left_x + length - 1]) == (255, 0, 0)
+    assert int(white3[by0, left_x]) == 255
+    # 唔跟圖案頂
+    assert by0 > graphic3[1]
+
+    # End-to-end: 無圖案內實心色塊，開廢墨條後定位線同紅標都跟 C/M/Y/K 色條
+    img = Image.fromarray(np.dstack([rgb, alpha]))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    png = buf.getvalue()
+    result = process_artwork(
+        png,
+        "lead_in_red.png",
+        choke_px=0,
+        polarity="white_prints",
+        dpi_override=dpi,
+        spot_invert_export=False,
+        lead_in_bar=True,
+        registration_guides=False,
+        red_top_marks=True,
+    )
+    assert result.lead_in_bar
+    assert result.red_top_marks
+
+    result_g = process_artwork(
+        png,
+        "lead_in_guides.png",
+        choke_px=0,
+        polarity="white_prints",
+        dpi_override=dpi,
+        spot_invert_export=False,
+        lead_in_bar=True,
+        registration_guides=True,
+        red_top_marks=True,
+    )
+    assert result_g.registration_guides
+    assert result_g.red_top_marks
+
+    from app import apply_registration_guides
+
+    rgb2g, a2g, c2g, w2g, bar_g, pad_g = apply_lead_in_bar(
+        rgb, alpha, alpha.copy(), alpha.copy(), dpi=dpi, polarity="white_prints",
+        content_box=(gx0, gy0, gx1, gy1),
+    )
+    rgb4, a4, _c4, _w4, g4, col4 = apply_registration_guides(
+        rgb2g, a2g, c2g, w2g, dpi=dpi, polarity="white_prints",
+        graphic_box=(gx0 + pad_g, gy0, gx1 + pad_g, gy1),
+        color_block_box=bar_g,
+    )
+    assert col4 is not None and g4 is not None
+    off = mm_to_px(GUIDE_OFFSET_MM, dpi)
+    lx = g4[0] - off
+    by0, by1 = col4[1], col4[3]
+    assert by0 == bar_g[1]
+    assert by1 == bar_g[3]
+    assert int(a4[by0, lx]) == 255
+    assert int(a4[by1, lx]) == 255
+    assert by0 > g4[1]  # 唔跟圖案頂
+    if by0 > 0:
+        assert int(a4[by0 - 1, lx]) == 0
 
 
 def test_guides_x_on_graphic_height_on_color_block():
@@ -406,6 +509,7 @@ if __name__ == "__main__":
     test_offset_white_x_shifts_right_without_wrap()
     test_soften_white_bottom_only_affects_lower_tenth()
     test_lead_in_bar_centered_expands_canvas()
+    test_red_marks_follow_lead_in_cmyk_block()
     test_guides_x_on_graphic_height_on_color_block()
     test_color_block_detects_solid_grey_ignores_distress()
     test_white_color_block_under_distress_is_detected()
