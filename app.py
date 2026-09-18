@@ -66,6 +66,12 @@ LEAD_IN_SEGMENT_RGB = (
     (255, 242, 0),    # Y
     (0, 0, 0),        # K
 )
+# Color Block 外側定位括號 [ ] + 頂部 K100% 黑條（不壓縮 Color Block）
+DEFAULT_REGISTRATION_GUIDES = True
+GUIDE_OFFSET_MM = 10.0  # 圖案左右外側 1 cm
+GUIDE_STROKE_PX = 2
+GUIDE_ARM_MM = 4.0  # [ ] 上下短橫朝內
+TOP_BLACK_BAR_HEIGHT_MM = 3.0
 DEFAULT_DPI = 300
 MAX_PREVIEW_EDGE = 640
 WHITE_NAME_ALIASES = {
@@ -95,6 +101,7 @@ class ProcessResult:
     white_x_offset_px: int = 0
     bottom_white_fade: int = 0
     lead_in_bar: bool = False
+    registration_guides: bool = False
 
 
 def mirror_planes(
@@ -284,6 +291,138 @@ def content_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
+def _paint_k100(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    coverage: np.ndarray,
+    white: np.ndarray,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    polarity: ChannelPolarity,
+) -> None:
+    """Fill inclusive-exclusive [y0:y1, x0:x1) with K100% black (+ white underbase)."""
+    if y1 <= y0 or x1 <= x0:
+        return
+    h, w = alpha.shape
+    yy0, yy1 = max(0, y0), min(h, y1)
+    xx0, xx1 = max(0, x0), min(w, x1)
+    if yy1 <= yy0 or xx1 <= xx0:
+        return
+    white_ink = 0 if polarity == "black_prints" else 255
+    rgb[yy0:yy1, xx0:xx1] = (0, 0, 0)
+    alpha[yy0:yy1, xx0:xx1] = 255
+    coverage[yy0:yy1, xx0:xx1] = 255
+    white[yy0:yy1, xx0:xx1] = white_ink
+
+
+def apply_registration_guides(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    coverage: np.ndarray,
+    white: np.ndarray,
+    dpi: float,
+    polarity: ChannelPolarity = "white_prints",
+    content_box: tuple[int, int, int, int] | None = None,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[int, int, int, int] | None,
+]:
+    """圖案外側 1cm 畫 [ ] 定位括號，Color Block 正上方加 K100% 橫黑條。
+
+    - 括號豎段高度／Y 只對齊 Color Block（不含頂部黑條）
+    - 左 `[`、右 `]`，上下短橫朝內
+    - 頂部黑條貼 Color Block 頂邊、等寬；只向上擴畫布，不壓縮 Color Block
+    回傳更新後的 Color Block bbox（padding 後座標）。
+    """
+    bbox = content_box if content_box is not None else content_bbox(alpha)
+    if bbox is None:
+        return rgb, alpha, coverage, white, None
+
+    x0, y0, x1, y1 = bbox
+    offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
+    arm = mm_to_px(GUIDE_ARM_MM, dpi)
+    stroke = max(1, int(GUIDE_STROKE_PX))
+    bar_h = mm_to_px(TOP_BLACK_BAR_HEIGHT_MM, dpi)
+
+    left_x = x0 - offset
+    right_x = x1 + offset
+
+    h, w = alpha.shape
+    pad_left = max(0, -left_x)
+    pad_right = max(0, right_x + 1 - w)
+    pad_top = max(0, bar_h - y0)
+
+    if pad_left or pad_right or pad_top:
+        new_h = h + pad_top
+        new_w = w + pad_left + pad_right
+        rgb_n = np.zeros((new_h, new_w, 3), dtype=np.uint8)
+        alpha_n = np.zeros((new_h, new_w), dtype=np.uint8)
+        coverage_n = np.zeros((new_h, new_w), dtype=np.uint8)
+        white_n = np.full(
+            (new_h, new_w),
+            255 if polarity == "black_prints" else 0,
+            dtype=np.uint8,
+        )
+        rgb_n[pad_top : pad_top + h, pad_left : pad_left + w] = rgb
+        alpha_n[pad_top : pad_top + h, pad_left : pad_left + w] = alpha
+        coverage_n[pad_top : pad_top + h, pad_left : pad_left + w] = coverage
+        white_n[pad_top : pad_top + h, pad_left : pad_left + w] = white
+        rgb, alpha, coverage, white = rgb_n, alpha_n, coverage_n, white_n
+        x0 += pad_left
+        x1 += pad_left
+        y0 += pad_top
+        y1 += pad_top
+        left_x += pad_left
+        right_x += pad_left
+
+    # 頂部黑條：貼 Color Block 頂邊，等寬，不重疊 Color Block
+    _paint_k100(
+        rgb, alpha, coverage, white,
+        y0 - bar_h, y0, x0, x1 + 1, polarity,
+    )
+
+    # 左 `[`：豎線 + 上下朝內短橫
+    _paint_k100(
+        rgb, alpha, coverage, white,
+        y0, y1 + 1, left_x, left_x + stroke, polarity,
+    )
+    _paint_k100(
+        rgb, alpha, coverage, white,
+        y0, y0 + stroke, left_x, left_x + arm, polarity,
+    )
+    _paint_k100(
+        rgb, alpha, coverage, white,
+        y1 - stroke + 1, y1 + 1, left_x, left_x + arm, polarity,
+    )
+
+    # 右 `]`：豎線 + 上下朝內短橫
+    _paint_k100(
+        rgb, alpha, coverage, white,
+        y0, y1 + 1, right_x - stroke + 1, right_x + 1, polarity,
+    )
+    _paint_k100(
+        rgb, alpha, coverage, white,
+        y0, y0 + stroke, right_x - arm + 1, right_x + 1, polarity,
+    )
+    _paint_k100(
+        rgb, alpha, coverage, white,
+        y1 - stroke + 1, y1 + 1, right_x - arm + 1, right_x + 1, polarity,
+    )
+
+    return (
+        np.ascontiguousarray(rgb),
+        np.ascontiguousarray(alpha),
+        np.ascontiguousarray(coverage),
+        np.ascontiguousarray(white),
+        (x0, y0, x1, y1),
+    )
+
+
 def apply_lead_in_bar(
     rgb: np.ndarray,
     alpha: np.ndarray,
@@ -291,13 +430,15 @@ def apply_lead_in_bar(
     white: np.ndarray,
     dpi: float,
     polarity: ChannelPolarity = "white_prints",
+    content_box: tuple[int, int, int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """在圖案正下方置中加 4×1 cm 廢墨條（距內容底邊 3mm）；不足則向下／向左右延伸畫布。
 
     彩墨為 C/M/Y/K 四段實色；白墨為 100% 噴白（跟 polarity）。
     於 choke／偏移／下端減弱之後套用，避免廢墨條被削弱。
+    content_box：若已加定位線／頂部黑條，傳入 Color Block bbox，避免把標記算進內容範圍。
     """
-    bbox = content_bbox(alpha)
+    bbox = content_box if content_box is not None else content_bbox(alpha)
     if bbox is None:
         return rgb, alpha, coverage, white
 
@@ -393,6 +534,7 @@ def process_artwork(
     white_x_offset_px: int = 0,
     bottom_white_fade: int = 0,
     lead_in_bar: bool = False,
+    registration_guides: bool = False,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
@@ -406,6 +548,17 @@ def process_artwork(
     if mirror_horizontal:
         rgb, alpha, coverage, white = mirror_planes(rgb, alpha, coverage, white)
     out_dpi = float(dpi_override or dpi)
+    color_block = content_bbox(alpha)
+    if registration_guides:
+        rgb, alpha, coverage, white, color_block = apply_registration_guides(
+            rgb,
+            alpha,
+            coverage,
+            white,
+            dpi=out_dpi,
+            polarity=polarity,
+            content_box=color_block,
+        )
     if lead_in_bar:
         rgb, alpha, coverage, white = apply_lead_in_bar(
             rgb,
@@ -414,6 +567,7 @@ def process_artwork(
             white,
             dpi=out_dpi,
             polarity=polarity,
+            content_box=color_block,
         )
     return ProcessResult(
         rgb=rgb,
@@ -427,6 +581,7 @@ def process_artwork(
         white_x_offset_px=int(white_x_offset_px),
         bottom_white_fade=int(bottom_white_fade),
         lead_in_bar=bool(lead_in_bar),
+        registration_guides=bool(registration_guides),
     )
 
 
@@ -746,6 +901,8 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         flags.append(f"下端起步白墨減弱 {result.bottom_white_fade}/10（最下約 1/10）")
     if result.lead_in_bar:
         flags.append("已加底部廢墨條（Lead-in，圖案正下方置中）")
+    if result.registration_guides:
+        flags.append("已加左右 [ ] 定位線（外側 1cm）＋頂部黑條")
     if result.mirror_horizontal:
         flags.append("已水平鏡像")
     if result.spot_invert_export:
@@ -1295,6 +1452,14 @@ def render_app() -> None:
                 "幫噴頭起步打通墨路。會自動加高畫布，預設關閉。"
             ),
         )
+        registration_guides = st.checkbox(
+            "啟用定位線 [ ] + 頂部黑條",
+            value=DEFAULT_REGISTRATION_GUIDES,
+            help=(
+                "圖案左右外側 1cm 畫 [ ] 定位括號（高度對齊 Color Block，不含頂部黑條）；"
+                f"Color Block 正上方加 {TOP_BLACK_BAR_HEIGHT_MM:g}mm K100% 黑條（等寬、不壓縮色塊）。"
+            ),
+        )
         spot_invert_export = st.checkbox(
             "PrintEXP 白墨反相寫入（修外框全白／印相反）",
             value=True,
@@ -1357,6 +1522,7 @@ def render_app() -> None:
                     white_x_offset_px=int(white_x_offset_px),
                     bottom_white_fade=int(bottom_white_fade),
                     lead_in_bar=bool(lead_in_bar),
+                    registration_guides=bool(registration_guides),
                 )
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
@@ -1405,6 +1571,7 @@ def render_app() -> None:
                     f"x={result.white_x_offset_px:+d}px · "
                     f"bottomFade={result.bottom_white_fade}/10 · "
                     f"leadIn={result.lead_in_bar} · "
+                    f"guides={result.registration_guides} · "
                     f"file={stem}_{channel_name}.tif"
                 )
                 st.info(
@@ -1413,7 +1580,8 @@ def render_app() -> None:
                     "若左右相反，打開「水平鏡像」再下載；"
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
                     "若下端起步透白，用「下端起步白墨減弱」；"
-                    "若要通墨，勾「啟用底部廢墨條」再下載。"
+                    "若要通墨，勾「啟用底部廢墨條」再下載；"
+                    "Color Block 對位用左右 [ ]（外側 1cm）同頂部黑條。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")

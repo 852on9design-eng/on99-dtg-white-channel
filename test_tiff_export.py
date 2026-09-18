@@ -195,6 +195,71 @@ def test_lead_in_bar_centered_expands_canvas():
     assert bar_w >= 100
 
 
+def test_registration_guides_brackets_and_top_bar():
+    from app import (
+        GUIDE_ARM_MM,
+        GUIDE_OFFSET_MM,
+        GUIDE_STROKE_PX,
+        TOP_BLACK_BAR_HEIGHT_MM,
+        apply_registration_guides,
+        mm_to_px,
+        rgb_alpha_to_cmyk,
+    )
+
+    dpi = 300.0
+    offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
+    arm = mm_to_px(GUIDE_ARM_MM, dpi)
+    bar_h = mm_to_px(TOP_BLACK_BAR_HEIGHT_MM, dpi)
+    stroke = GUIDE_STROKE_PX
+
+    h, w = 100, 140
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    # Color Block
+    x0, y0, x1, y1 = 40, 25, 99, 74
+    alpha[y0 : y1 + 1, x0 : x1 + 1] = 255
+    rgb[y0 : y1 + 1, x0 : x1 + 1] = (180, 60, 60)
+    coverage = alpha.copy()
+    white = alpha.copy()
+    block_h = y1 - y0 + 1
+    block_w = x1 - x0 + 1
+
+    rgb2, alpha2, coverage2, white2, bbox2 = apply_registration_guides(
+        rgb, alpha, coverage, white, dpi=dpi, polarity="white_prints"
+    )
+    assert bbox2 is not None
+    bx0, by0, bx1, by1 = bbox2
+    assert by1 - by0 + 1 == block_h
+    assert bx1 - bx0 + 1 == block_w
+    # Color Block pixels preserved (same count of original red block after shift)
+    assert int(np.sum((rgb2[:, :, 0] == 180) & (alpha2 > 0))) == block_h * block_w
+
+    # Top black bar sits directly above Color Block, same width
+    assert by0 >= bar_h
+    bar_row = by0 - 1
+    assert int(alpha2[bar_row, bx0]) == 255
+    assert int(rgb2[bar_row, bx0, 0]) == 0
+    assert int(alpha2[bar_row, bx1]) == 255
+    # Bar must not cover Color Block top row interior (still original red)
+    assert int(rgb2[by0, (bx0 + bx1) // 2, 0]) == 180
+
+    left_x = bx0 - offset
+    right_x = bx1 + offset
+    # Vertical stems align to Color Block Y only (not into top bar)
+    assert int(alpha2[by0, left_x]) == 255
+    assert int(alpha2[by1, left_x]) == 255
+    assert int(alpha2[by0 - 1, left_x]) == 0  # above block: no guide stem
+    assert int(alpha2[by0, right_x]) == 255
+    assert int(alpha2[by1, right_x]) == 255
+    # Inward arms: left `[` opens right, right `]` opens left
+    assert int(alpha2[by0, left_x + arm - 1]) == 255
+    assert int(alpha2[by0, right_x - arm + 1]) == 255
+    assert stroke >= 1
+
+    cmyk = rgb_alpha_to_cmyk(rgb2, alpha2)
+    assert int(cmyk[bar_row, bx0, 3]) > 200  # K heavy on top bar
+
+
 if __name__ == "__main__":
     test_default_cmyk_spot_named_white()
     test_rgb_spot_mode()
@@ -204,4 +269,5 @@ if __name__ == "__main__":
     test_offset_white_x_shifts_right_without_wrap()
     test_soften_white_bottom_only_affects_lower_tenth()
     test_lead_in_bar_centered_expands_canvas()
+    test_registration_guides_brackets_and_top_bar()
     print("OK")
