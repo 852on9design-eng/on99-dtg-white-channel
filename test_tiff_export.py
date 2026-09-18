@@ -283,9 +283,11 @@ def test_white_color_block_under_distress_is_detected():
     assert x0 >= 34 and x1 <= 85
 
 
-def test_white_only_art_no_guides():
-    from app import apply_registration_guides, color_block_bbox
+def test_white_only_art_still_draws_guides_at_graphic_height():
+    from app import GUIDE_OFFSET_MM, apply_registration_guides, color_block_bbox, mm_to_px
 
+    dpi = 300.0
+    offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
     h, w = 80, 100
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
     alpha = np.zeros((h, w), dtype=np.uint8)
@@ -293,13 +295,17 @@ def test_white_only_art_no_guides():
     rgb[10:70, 10:90] = (255, 255, 255)
     assert color_block_bbox(rgb, alpha) is None
 
-    rgb2, alpha2, _c, _w, g2, c2 = apply_registration_guides(
-        rgb, alpha, alpha.copy(), alpha.copy(), dpi=300.0
+    rgb2, alpha2, _c, white2, g2, c2 = apply_registration_guides(
+        rgb, alpha, alpha.copy(), alpha.copy(), dpi=dpi
     )
-    assert c2 is None
-    assert g2 == (10, 10, 89, 69)
-    assert np.array_equal(rgb2, rgb)
-    assert int(alpha2.sum()) == int(alpha.sum())
+    assert g2 is not None and c2 is not None
+    assert c2[1] == g2[1] and c2[3] == g2[3]
+    assert g2[3] - g2[1] == 69 - 10
+    left_x = g2[0] - offset
+    assert int(alpha2[g2[1], left_x]) == 255
+    assert int(alpha2[g2[3], left_x]) == 255
+    assert int(white2[g2[1], left_x]) == 255
+    assert tuple(int(v) for v in rgb2[g2[1], left_x]) == (0, 0, 0)
 
 
 if __name__ == "__main__":
@@ -314,5 +320,5 @@ if __name__ == "__main__":
     test_guides_x_on_graphic_height_on_color_block()
     test_color_block_detects_solid_grey_ignores_distress()
     test_white_color_block_under_distress_is_detected()
-    test_white_only_art_no_guides()
+    test_white_only_art_still_draws_guides_at_graphic_height()
     print("OK")
