@@ -302,7 +302,7 @@ def _paint_k100(
     x1: int,
     polarity: ChannelPolarity,
 ) -> None:
-    """Fill inclusive-exclusive [y0:y1, x0:x1) with K100% black (+ white underbase)."""
+    """Fill inclusive-exclusive [y0:y1, x0:x1) with K100% black only（唔打白底）."""
     if y1 <= y0 or x1 <= x0:
         return
     h, w = alpha.shape
@@ -310,11 +310,12 @@ def _paint_k100(
     xx0, xx1 = max(0, x0), min(w, x1)
     if yy1 <= yy0 or xx1 <= xx0:
         return
-    white_ink = 0 if polarity == "black_prints" else 255
+    # 定位線／頂部黑條只噴黑墨：white_prints 白通道=0；black_prints 白通道=255（唔噴白）
+    no_white = 255 if polarity == "black_prints" else 0
     rgb[yy0:yy1, xx0:xx1] = (0, 0, 0)
     alpha[yy0:yy1, xx0:xx1] = 255
     coverage[yy0:yy1, xx0:xx1] = 255
-    white[yy0:yy1, xx0:xx1] = white_ink
+    white[yy0:yy1, xx0:xx1] = no_white
 
 
 def apply_registration_guides(
@@ -1458,6 +1459,7 @@ def render_app() -> None:
             help=(
                 "圖案左右外側 1cm 畫 [ ] 定位括號（高度對齊 Color Block，不含頂部黑條）；"
                 f"Color Block 正上方加 {TOP_BLACK_BAR_HEIGHT_MM:g}mm K100% 黑條（等寬、不壓縮色塊）。"
+                "定位線同頂部黑條只噴黑墨，唔打白底。"
             ),
         )
         spot_invert_export = st.checkbox(

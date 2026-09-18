@@ -258,6 +258,13 @@ def test_registration_guides_brackets_and_top_bar():
 
     cmyk = rgb_alpha_to_cmyk(rgb2, alpha2)
     assert int(cmyk[bar_row, bx0, 3]) > 200  # K heavy on top bar
+    # Guides / top bar: black ink only — no white underbase
+    assert int(white2[bar_row, bx0]) == 0
+    assert int(white2[by0, left_x]) == 0
+    assert int(rgb2[by0, left_x, 0]) == 0
+    assert int(rgb2[by0, left_x, 1]) == 0
+    assert int(rgb2[by0, left_x, 2]) == 0
+    assert int(cmyk[by0, left_x, 3]) > 200
 
 
 if __name__ == "__main__":
