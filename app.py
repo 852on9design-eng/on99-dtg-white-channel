@@ -291,7 +291,7 @@ def content_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
 
 
 def graphic_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
-    """整體圖案（Graphic）外框：左右定位線 X 跟呢個。"""
+    """整體圖案（Graphic）外框：定位線左右 X = 最左／最右外側 1cm。"""
     return content_bbox(alpha)
 
 
@@ -299,13 +299,16 @@ def color_block_bbox(
     rgb: np.ndarray,
     alpha: np.ndarray,
     *,
-    min_chroma: int = 25,
-    near_black: int = 48,
+    near_white: int = 250,
+    max_channel_std: float = 22.0,
+    min_fill_ratio: float = 0.80,
+    min_side_px: int = 12,
+    min_area_px: int = 200,
 ) -> tuple[int, int, int, int] | None:
-    """Color Block 外框：定位線豎段長度（Y）跟呢個。
+    """Color Block 外框：定位線豎段高度（Y）跟呢個。
 
-    用有彩度（或實黑 K）嘅不透明像素；唔計近白／灰色甩色噪點。
-    若偵測唔到獨立色塊，回傳 None（呼叫端改用圖案內容高）。
+    找「非近白 + 塊內顏色夠平均 + 接近矩形」嘅實心色塊（可係灰／彩／黑）。
+    甩色／高紋理圖案唔會當成 Color Block。偵測唔到 → None（唔畫線）。
     """
     alpha_u = np.asarray(alpha)
     opaque = alpha_u > 0
@@ -314,15 +317,50 @@ def color_block_bbox(
     rgb_u = np.asarray(rgb)
     if rgb_u.ndim != 3 or rgb_u.shape[:2] != alpha_u.shape:
         return None
-    mx = rgb_u.max(axis=2)
-    mn = rgb_u.min(axis=2)
-    chroma = mx.astype(np.int16) - mn.astype(np.int16)
-    chromatic = opaque & (chroma >= int(min_chroma))
-    solid_k = opaque & (mx <= int(near_black))
-    mask = chromatic | solid_k
-    if not np.any(mask):
+
+    r = rgb_u[:, :, 0]
+    g = rgb_u[:, :, 1]
+    b = rgb_u[:, :, 2]
+    # 近白（含白墨底）唔算色塊
+    nw = (
+        (r >= near_white)
+        & (g >= near_white)
+        & (b >= near_white)
+    )
+    candidate = opaque & ~nw
+    if not np.any(candidate):
         return None
-    return content_bbox(mask.astype(np.uint8) * 255)
+
+    try:
+        import cv2
+
+        num, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            candidate.astype(np.uint8), connectivity=8
+        )
+    except Exception:
+        return content_bbox(candidate.astype(np.uint8) * 255)
+
+    best: tuple[int, int, int, int] | None = None
+    best_score = 0.0
+    for i in range(1, num):
+        x, y, bw, bh, area = (int(v) for v in stats[i])
+        if bw < min_side_px or bh < min_side_px or area < min_area_px:
+            continue
+        fill = float(area) / float(bw * bh)
+        if fill < float(min_fill_ratio):
+            continue
+        comp = labels == i
+        # 塊內 RGB 標準差低 = 實心色塊；甩色紋理會好高
+        rs = float(r[comp].std())
+        gs = float(g[comp].std())
+        bs = float(b[comp].std())
+        if max(rs, gs, bs) > float(max_channel_std):
+            continue
+        score = float(area) * fill
+        if score > best_score:
+            best_score = score
+            best = (x, y, x + bw - 1, y + bh - 1)
+    return best
 
 
 def _paint_k100(
@@ -369,12 +407,12 @@ def apply_registration_guides(
     tuple[int, int, int, int] | None,
     tuple[int, int, int, int] | None,
 ]:
-    """圖案左右外側 1cm 畫 [ ] 定位括號（K100% 黑墨，無頂部黑條）。
+    """大圖案左右外側 1cm 畫 [ ] 定位括號（K100% 黑墨，無頂部黑條）。
 
-    - 左右 X：圖案最左／最右外側 1cm
-    - 豎段高度 Y：對齊 Color Block 頂～底
+    - 左右 X：圖案最左／最右外側 1cm（GUIDE_OFFSET_MM）
+    - 豎段高度 Y：對齊 Color Block 頂～底（唔跟圖案總高）
     - 上下短橫朝內 GUIDE_ARM_MM；線寬 GUIDE_STROKE_PX
-    - 偵測唔到 Color Block → 唔畫（唔退回圖案高）
+    - 偵測唔到 Color Block → 唔畫
     回傳 (planes..., graphic_box', color_block_box'|None)。
     """
     graphic = graphic_box if graphic_box is not None else graphic_bbox(alpha)
@@ -383,12 +421,12 @@ def apply_registration_guides(
     color = color_block_box
     if color is None:
         color = color_block_bbox(rgb, alpha)
-    # 無 Color Block → 唔畫定位線（唔退回圖案高）
+    # 無 Color Block → 唔畫定位線
     if color is None:
         return rgb, alpha, coverage, white, graphic, None
 
     gx0, gy0, gx1, gy1 = graphic
-    _cx0, cy0, _cx1, cy1 = color
+    cx0, cy0, cx1, cy1 = color
     offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
     arm = mm_to_px(GUIDE_ARM_MM, dpi)
     stroke = max(1, int(GUIDE_STROKE_PX))
@@ -417,11 +455,12 @@ def apply_registration_guides(
         rgb, alpha, coverage, white = rgb_n, alpha_n, coverage_n, white_n
         gx0 += pad_left
         gx1 += pad_left
+        cx0 += pad_left
+        cx1 += pad_left
         left_x += pad_left
         right_x += pad_left
-        color = (color[0] + pad_left, cy0, color[2] + pad_left, cy1)
 
-    # 左 `[`：豎段高度 = Color Block；短橫朝內
+    # 左 `[`：X = 圖案外側 1cm；豎段 = Color Block 高
     _paint_k100(
         rgb, alpha, coverage, white,
         cy0, cy1 + 1, left_x, left_x + stroke, polarity,
@@ -455,7 +494,7 @@ def apply_registration_guides(
         np.ascontiguousarray(coverage),
         np.ascontiguousarray(white),
         (gx0, gy0, gx1, gy1),
-        (color[0], cy0, color[2], cy1),
+        (cx0, cy0, cx1, cy1),
     )
 
 
@@ -943,7 +982,7 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         flags.append("已加底部廢墨條（Lead-in，圖案正下方置中）")
     if result.registration_guides:
         flags.append(
-            "已加左右 [ ] 定位線（外側 1cm；豎段=Color Block；短橫 4mm；線寬 2px）"
+            "已加左右 [ ] 定位線（X=圖案外側 1cm；豎段=Color Block 高；短橫 4mm；線寬 2px）"
         )
     if result.mirror_horizontal:
         flags.append("已水平鏡像")
@@ -1498,9 +1537,9 @@ def render_app() -> None:
             "啟用定位線 [ ]",
             value=DEFAULT_REGISTRATION_GUIDES,
             help=(
-                "左右外側 1cm 畫 [ ]："
-                "豎段高度=Color Block；上下短橫朝內 4mm；線寬 2px；K100% 黑墨。"
-                "有偵測到 Color Block 先會畫；無色塊唔畫定位線。"
+                "大圖案左右外側 1cm 畫 [ ]："
+                "豎段高度=Color Block 高；上下短橫朝內 4mm；線寬 2px；K100% 黑墨。"
+                "有偵測到實心 Color Block 先會畫；無色塊唔畫。"
             ),
         )
         spot_invert_export = st.checkbox(
@@ -1624,7 +1663,7 @@ def render_app() -> None:
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
                     "若下端起步透白，用「下端起步白墨減弱」；"
                     "若要通墨，勾「啟用底部廢墨條」再下載；"
-                    "對位用左右 [ ]（有 Color Block 先畫；外側 1cm；豎段=色塊高）。"
+                    "對位用左右 [ ]（X=圖案外側 1cm；豎段=Color Block 高）。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
