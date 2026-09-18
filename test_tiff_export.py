@@ -280,6 +280,31 @@ def test_color_block_bbox_ignores_gray_distress():
     assert graphic_bbox(alpha) == (10, 10, 89, 69)
 
 
+def test_no_color_block_skips_registration_guides():
+    from app import GUIDE_OFFSET_MM, apply_registration_guides, mm_to_px
+
+    dpi = 300.0
+    offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
+    h, w = 80, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    alpha[10:70, 10:90] = 255
+    rgb[10:70, 10:90] = (255, 255, 255)
+    coverage = alpha.copy()
+    white = alpha.copy()
+
+    rgb2, alpha2, coverage2, white2, graphic2, color2 = apply_registration_guides(
+        rgb, alpha, coverage, white, dpi=dpi, polarity="white_prints"
+    )
+    assert graphic2 == (10, 10, 89, 69)
+    assert color2 is None
+    # No guides drawn outside graphic
+    left_x = 10 - offset
+    assert left_x < 0 or int(alpha2[:, max(0, left_x)].max()) == 0
+    assert np.array_equal(rgb2, rgb)
+    assert int(alpha2.sum()) == int(alpha.sum())
+
+
 if __name__ == "__main__":
     test_default_cmyk_spot_named_white()
     test_rgb_spot_mode()
@@ -291,4 +316,5 @@ if __name__ == "__main__":
     test_lead_in_bar_centered_expands_canvas()
     test_registration_guides_color_block_height_graphic_x()
     test_color_block_bbox_ignores_gray_distress()
+    test_no_color_block_skips_registration_guides()
     print("OK")

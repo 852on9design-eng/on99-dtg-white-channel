@@ -374,14 +374,18 @@ def apply_registration_guides(
     - 左右 X：圖案最左／最右外側 1cm
     - 豎段高度 Y：對齊 Color Block 頂～底
     - 上下短橫朝內 GUIDE_ARM_MM；線寬 GUIDE_STROKE_PX
-    回傳 (planes..., graphic_box', color_block_box')。
+    - 偵測唔到 Color Block → 唔畫（唔退回圖案高）
+    回傳 (planes..., graphic_box', color_block_box'|None)。
     """
     graphic = graphic_box if graphic_box is not None else graphic_bbox(alpha)
     if graphic is None:
         return rgb, alpha, coverage, white, None, None
     color = color_block_box
     if color is None:
-        color = color_block_bbox(rgb, alpha) or graphic
+        color = color_block_bbox(rgb, alpha)
+    # 無 Color Block → 唔畫定位線（唔退回圖案高）
+    if color is None:
+        return rgb, alpha, coverage, white, graphic, None
 
     gx0, gy0, gx1, gy1 = graphic
     _cx0, cy0, _cx1, cy1 = color
@@ -581,8 +585,9 @@ def process_artwork(
         rgb, alpha, coverage, white = mirror_planes(rgb, alpha, coverage, white)
     out_dpi = float(dpi_override or dpi)
     graphic = graphic_bbox(alpha)
-    color_block = color_block_bbox(rgb, alpha) or graphic
-    if registration_guides:
+    color_block = color_block_bbox(rgb, alpha)
+    guides_applied = False
+    if registration_guides and color_block is not None:
         rgb, alpha, coverage, white, graphic, color_block = apply_registration_guides(
             rgb,
             alpha,
@@ -593,6 +598,7 @@ def process_artwork(
             graphic_box=graphic,
             color_block_box=color_block,
         )
+        guides_applied = color_block is not None
     if lead_in_bar:
         rgb, alpha, coverage, white = apply_lead_in_bar(
             rgb,
@@ -615,7 +621,7 @@ def process_artwork(
         white_x_offset_px=int(white_x_offset_px),
         bottom_white_fade=int(bottom_white_fade),
         lead_in_bar=bool(lead_in_bar),
-        registration_guides=bool(registration_guides),
+        registration_guides=bool(guides_applied),
     )
 
 
@@ -1493,8 +1499,8 @@ def render_app() -> None:
             value=DEFAULT_REGISTRATION_GUIDES,
             help=(
                 "左右外側 1cm 畫 [ ]："
-                "豎段高度=Color Block；上下短橫朝內 4mm；線寬 2px。"
-                "只噴 K100% 黑墨，唔打白底；無頂部黑條。"
+                "豎段高度=Color Block；上下短橫朝內 4mm；線寬 2px；K100% 黑墨。"
+                "有偵測到 Color Block 先會畫；無色塊唔畫定位線。"
             ),
         )
         spot_invert_export = st.checkbox(
@@ -1618,7 +1624,7 @@ def render_app() -> None:
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
                     "若下端起步透白，用「下端起步白墨減弱」；"
                     "若要通墨，勾「啟用底部廢墨條」再下載；"
-                    "對位用左右 [ ]（外側 1cm；豎段=Color Block；短橫 4mm）。"
+                    "對位用左右 [ ]（有 Color Block 先畫；外側 1cm；豎段=色塊高）。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
