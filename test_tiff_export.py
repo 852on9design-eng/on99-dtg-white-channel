@@ -131,7 +131,7 @@ def test_lead_in_bar_centered_expands_canvas():
     coverage = alpha.copy()
     white = alpha.copy()
 
-    rgb2, alpha2, coverage2, white2, bar_box, _pad = apply_lead_in_bar(
+    rgb2, alpha2, coverage2, white2, bar_box, pad_left = apply_lead_in_bar(
         rgb, alpha, coverage, white, dpi=dpi, polarity="white_prints"
     )
     gap = mm_to_px(LEAD_IN_GAP_MM, dpi)
@@ -143,8 +143,10 @@ def test_lead_in_bar_centered_expands_canvas():
     assert alpha2.shape[0] == expected_h
     assert alpha2.shape[1] >= w
     assert alpha2.shape[1] >= bar_w
-    assert int(alpha2[:h, :].max()) == 255
-    assert int((alpha2[:h] > 0).sum()) == int((alpha > 0).sum())
+    assert np.array_equal(
+        rgb2[20:60, 40 + pad_left : 80 + pad_left],
+        rgb[20:60, 40:80],
+    )
     cy = bar_top + bar_h // 2
     cx = alpha2.shape[1] // 2
     assert int(white2[cy, cx]) == 255
@@ -158,6 +160,72 @@ def test_lead_in_bar_centered_expands_canvas():
     assert bar_w >= 100
     assert bar_box is not None
     assert bar_box[1] == bar_top
+    assert bar_box[3] - bar_box[1] + 1 == bar_h
+
+
+def test_preheat_bar_optional_solid_mix():
+    """預熱條可選；單色融合疊喺 Color Block 頂，色塊高度唔變。"""
+    from app import (
+        LEAD_IN_GAP_MM,
+        LEAD_IN_HEIGHT_MM,
+        PREHEAT_HEIGHT_RATIO,
+        PREHEAT_RGB,
+        apply_lead_in_bar,
+        mm_to_px,
+        process_artwork,
+    )
+    from PIL import Image
+    import io
+
+    dpi = 300.0
+    h, w = 80, 120
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    alpha[20:60, 40:80] = 255
+    rgb[20:60, 40:80] = (200, 40, 40)
+    assert PREHEAT_RGB == (85, 0, 85)
+
+    off = apply_lead_in_bar(
+        rgb, alpha, alpha.copy(), alpha.copy(), dpi=dpi, include_preheat=False
+    )
+    on = apply_lead_in_bar(
+        rgb, alpha, alpha.copy(), alpha.copy(), dpi=dpi, include_preheat=True
+    )
+    bar_off = off[4]
+    bar_on = on[4]
+    assert bar_off is not None and bar_on is not None
+    bar_h = mm_to_px(LEAD_IN_HEIGHT_MM, dpi)
+    preheat_h = max(1, int(round(bar_h * PREHEAT_HEIGHT_RATIO)))
+    assert bar_off[3] - bar_off[1] + 1 == bar_h
+    assert bar_on[3] - bar_on[1] + 1 == bar_h
+    assert bar_on[1] == bar_off[1] + preheat_h
+    gap = mm_to_px(LEAD_IN_GAP_MM, dpi)
+    preheat_top = 59 + 1 + gap
+    rgb_on = on[0]
+    cx = rgb_on.shape[1] // 2
+    assert tuple(int(v) for v in rgb_on[preheat_top, cx]) == PREHEAT_RGB
+    assert tuple(int(v) for v in rgb_on[preheat_top, bar_on[0]]) == PREHEAT_RGB
+    assert tuple(int(v) for v in rgb_on[preheat_top, bar_on[2]]) == PREHEAT_RGB
+
+    img = Image.fromarray(np.dstack([rgb, alpha]))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    png = buf.getvalue()
+    no_pre = process_artwork(
+        png, "a.png", choke_px=0, polarity="white_prints", dpi_override=dpi,
+        spot_invert_export=False, lead_in_bar=True, preheat_bar=False,
+    )
+    with_pre = process_artwork(
+        png, "b.png", choke_px=0, polarity="white_prints", dpi_override=dpi,
+        spot_invert_export=False, lead_in_bar=True, preheat_bar=True,
+    )
+    only_pre = process_artwork(
+        png, "c.png", choke_px=0, polarity="white_prints", dpi_override=dpi,
+        spot_invert_export=False, lead_in_bar=False, preheat_bar=True,
+    )
+    assert no_pre.lead_in_bar and not no_pre.preheat_bar
+    assert with_pre.lead_in_bar and with_pre.preheat_bar
+    assert not only_pre.lead_in_bar and not only_pre.preheat_bar
 
 
 def test_red_marks_follow_lead_in_cmyk_block():
@@ -257,8 +325,35 @@ def test_red_marks_follow_lead_in_cmyk_block():
     assert int(a4[by0, lx]) == 255
     assert int(a4[by1, lx]) == 255
     assert by0 > g4[1]  # 唔跟圖案頂
+    # 豎段由 Color Block 頂開始；頂上面可以係單色預熱條，唔係 [ 繼續向上
     if by0 > 0:
-        assert int(a4[by0 - 1, lx]) == 0
+        above = tuple(int(v) for v in rgb4[by0 - 1, lx])
+        from app import PREHEAT_RGB
+        assert above == PREHEAT_RGB or int(a4[by0 - 1, lx]) == 0
+
+
+def test_four_color_strip_detected_as_color_block():
+    """圖下端 C/M/Y/K 四色長方形 = Color Block。"""
+    from app import LEAD_IN_SEGMENT_RGB, color_block_bbox, four_color_strip_bbox
+
+    h, w = 120, 200
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    alpha[10:80, 20:180] = 255
+    rgb[10:80, 20:180] = (50, 50, 50)
+    y0, y1 = 90, 109
+    xs = [40, 70, 100, 130, 160]
+    for i, color in enumerate(LEAD_IN_SEGMENT_RGB):
+        rgb[y0 : y1 + 1, xs[i] : xs[i + 1]] = color
+        alpha[y0 : y1 + 1, xs[i] : xs[i + 1]] = 255
+
+    box = four_color_strip_bbox(rgb, alpha)
+    assert box is not None, box
+    assert abs(box[0] - xs[0]) <= 2
+    assert abs(box[2] - (xs[-1] - 1)) <= 2
+    assert abs(box[1] - y0) <= 2
+    assert abs(box[3] - y1) <= 2
+    assert color_block_bbox(rgb, alpha) == box
 
 
 def test_guides_x_on_graphic_height_on_color_block():
@@ -509,7 +604,9 @@ if __name__ == "__main__":
     test_offset_white_x_shifts_right_without_wrap()
     test_soften_white_bottom_only_affects_lower_tenth()
     test_lead_in_bar_centered_expands_canvas()
+    test_preheat_bar_optional_solid_mix()
     test_red_marks_follow_lead_in_cmyk_block()
+    test_four_color_strip_detected_as_color_block()
     test_guides_x_on_graphic_height_on_color_block()
     test_color_block_detects_solid_grey_ignores_distress()
     test_white_color_block_under_distress_is_detected()

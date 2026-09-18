@@ -9,7 +9,8 @@
 - 再用 **Choke** 略收，避免白邊露出彩墨。
 - 可選 **白墨水平偏移 (X)**：只移白墨通道對齊面層套準（正數往右；預設 0）。
 - 可選 **下端起步白墨減弱**：只減弱全圖最下約 1/10 區白墨濃度（噴頭剛起步露白時用；預設 0）。
-- 可選 **底部廢墨條 (Lead-in Bar)**：圖案正下方置中加 4×1 cm 通墨條（預設關；自動加高畫布）。
+- 可選 **底部廢墨條 (Lead-in Bar)**：圖案正下方貼近加 Color Block（4×1 cm C/M/Y/K）。
+- 可選 **預熱條**：Color Block 頂再加 1/4 高單色條（黑＋紅＋藍融合）；唔勾就不畫，色塊高度唔變。
 - 可選 **定位線 [ ]／紅標橫線**：X=大圖案外側 1cm；高度跟底部 C/M/Y/K Color Block（廢墨條）。
 - PrintEXP 匯出預設 **反相寫入 Spot**（避免 RIP 外框全白／印相反）。
 - 可選 **水平鏡像**（PrintEXP／轉印左右相反時開）。
@@ -57,15 +58,23 @@ DEFAULT_WHITE_X_OFFSET_PX = 0
 DEFAULT_BOTTOM_WHITE_FADE = 0
 BOTTOM_WHITE_FADE_BAND_RATIO = 0.1  # 全圖最下約 1/10
 DEFAULT_LEAD_IN_BAR = False
-LEAD_IN_GAP_MM = 3.0
+DEFAULT_PREHEAT_BAR = False
+LEAD_IN_GAP_MM = 1.0  # 貼近圖案（舊 3mm）；預熱條再夾喺圖案同 Color Block 之間
 LEAD_IN_WIDTH_MM = 40.0  # 4 cm
-LEAD_IN_HEIGHT_MM = 10.0  # 1 cm
+LEAD_IN_HEIGHT_MM = 10.0  # 1 cm Color Block，高度唔變
+PREHEAT_HEIGHT_RATIO = 0.25  # Color Block 頂再加 1/4 高預熱條（單色）
 # RGB 近似 C/M/Y/K，匯出 CMYK 時四色噴頭都會出墨
 LEAD_IN_SEGMENT_RGB = (
     (0, 174, 239),    # C
     (236, 0, 140),    # M
     (255, 242, 0),    # Y
     (0, 0, 0),        # K
+)
+# 預熱條：黑＋紅＋藍各 1/3 融合為一條單色
+PREHEAT_RGB = (
+    int(round((0 + 255 + 0) / 3)),    # 85
+    int(round((0 + 0 + 0) / 3)),      # 0
+    int(round((0 + 0 + 255) / 3)),    # 85
 )
 # 圖案外側定位括號 [ ]（K100% 黑墨 + 100% 白底，方便 RIP／貼 mask tape）
 DEFAULT_REGISTRATION_GUIDES = True
@@ -105,6 +114,7 @@ class ProcessResult:
     white_x_offset_px: int = 0
     bottom_white_fade: int = 0
     lead_in_bar: bool = False
+    preheat_bar: bool = False
     registration_guides: bool = False
     red_top_marks: bool = False
 
@@ -301,7 +311,7 @@ def graphic_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
     return content_bbox(alpha)
 
 
-def color_block_bbox(
+def _iter_solid_rects(
     rgb: np.ndarray,
     alpha: np.ndarray,
     *,
@@ -310,29 +320,19 @@ def color_block_bbox(
     min_fill_ratio: float = 0.82,
     min_side_px: int = 8,
     min_area_px: int = 200,
-) -> tuple[int, int, int, int] | None:
-    """Color Block 外框：定位線豎段高度（Y）跟呢個。
-
-    用「局部顏色平坦 + 同色連通 + 接近矩形」搵實心色塊（白／灰／彩／黑）。
-    甩色圖案同「同大圖案一樣大」嘅件會跳過。偵測唔到 → None。
-    """
+) -> list[tuple[int, int, int, int, int, int]]:
+    """實心矩形：(x0, y0, x1, y1, bw, bh)。偵測失敗 → 空表。"""
     alpha_u = np.asarray(alpha)
     opaque = alpha_u > 0
     if not np.any(opaque):
-        return None
+        return []
     rgb_u = np.asarray(rgb)
     if rgb_u.ndim != 3 or rgb_u.shape[:2] != alpha_u.shape:
-        return None
+        return []
 
     r = rgb_u[:, :, 0].astype(np.float32)
     g = rgb_u[:, :, 1].astype(np.float32)
     b = rgb_u[:, :, 2].astype(np.float32)
-    graphic = content_bbox(alpha_u)
-    gw = gh = 0
-    if graphic is not None:
-        gw = graphic[2] - graphic[0] + 1
-        gh = graphic[3] - graphic[1] + 1
-
     try:
         import cv2
 
@@ -343,13 +343,11 @@ def color_block_bbox(
         local_std = np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
         solid = opaque & (local_std <= float(local_std_max))
         if not np.any(solid):
-            return None
+            return []
 
-        # 同色分組，避免色塊貼住圖案時被連成一件
         q = (rgb_u // 16).astype(np.uint32)
         packed = (q[:, :, 0] << 16) | (q[:, :, 1] << 8) | q[:, :, 2]
-        best: tuple[int, int, int, int] | None = None
-        best_score = 0.0
+        found: list[tuple[int, int, int, int, int, int]] = []
         for color_id in np.unique(packed[solid]):
             mask = (solid & (packed == color_id)).astype(np.uint8)
             num, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
@@ -362,21 +360,120 @@ def color_block_bbox(
                 fill = float(area) / float(max(1, bw * bh))
                 if fill < float(min_fill_ratio):
                     continue
-                if gw > 0 and gh > 0 and bw >= int(0.85 * gw) and bh >= int(0.85 * gh):
-                    continue
                 region = mask[y : y + bh, x : x + bw] > 0
                 rs = float(r[y : y + bh, x : x + bw][region].std())
                 gs = float(g[y : y + bh, x : x + bw][region].std())
                 bs = float(b[y : y + bh, x : x + bw][region].std())
                 if max(rs, gs, bs) > float(max_channel_std):
                     continue
-                score = float(area) * fill
-                if score > best_score:
-                    best_score = score
-                    best = (x, y, x + bw - 1, y + bh - 1)
-        return best
+                found.append((x, y, x + bw - 1, y + bh - 1, bw, bh))
+        return found
     except Exception:
+        return []
+
+
+def four_color_strip_bbox(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+) -> tuple[int, int, int, int] | None:
+    """圖下端四色長方形（C/M/Y/K 四段橫排）外框。搵唔到 → None。"""
+    rects = _iter_solid_rects(rgb, alpha)
+    if len(rects) < 4:
         return None
+    graphic = content_bbox(alpha)
+    mid_y = None
+    gw = gh = 0
+    if graphic is not None:
+        gw = graphic[2] - graphic[0] + 1
+        gh = graphic[3] - graphic[1] + 1
+        mid_y = (graphic[1] + graphic[3]) // 2
+
+    best: tuple[int, int, int, int] | None = None
+    best_score = -1.0
+    ordered = sorted(rects, key=lambda t: (t[1], t[0]))
+    for i, a in enumerate(ordered):
+        row = [a]
+        for b in ordered:
+            if b is a:
+                continue
+            if abs(b[1] - a[1]) > 8:
+                continue
+            if abs(b[5] - a[5]) > max(6, int(0.3 * a[5])):
+                continue
+            row.append(b)
+        if len(row) < 4:
+            continue
+        row.sort(key=lambda t: t[0])
+        for j in range(len(row) - 3):
+            four = row[j : j + 4]
+            adjacent = True
+            for k in range(3):
+                gap = four[k + 1][0] - four[k][2]
+                if gap < -3 or gap > max(10, four[k][4] // 2):
+                    adjacent = False
+                    break
+            if not adjacent:
+                continue
+            ux0 = four[0][0]
+            uy0 = min(t[1] for t in four)
+            ux1 = four[3][2]
+            uy1 = max(t[3] for t in four)
+            bw = ux1 - ux0 + 1
+            bh = uy1 - uy0 + 1
+            if gw > 0 and gh > 0 and bw >= int(0.85 * gw) and bh >= int(0.85 * gh):
+                continue
+            if mid_y is not None and uy1 < mid_y:
+                continue
+            score = float(uy1) * bw
+            if score > best_score:
+                best_score = score
+                best = (ux0, uy0, ux1, uy1)
+    return best
+
+
+def color_block_bbox(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    *,
+    max_channel_std: float = 22.0,
+    local_std_max: float = 12.0,
+    min_fill_ratio: float = 0.82,
+    min_side_px: int = 8,
+    min_area_px: int = 200,
+) -> tuple[int, int, int, int] | None:
+    """Color Block 外框：優先圖下端四色（C/M/Y/K）長方形。
+
+    搵唔到四色條先用單塊實心色。甩色圖案同「同大圖案一樣大」嘅件會跳過。
+    """
+    strip = four_color_strip_bbox(rgb, alpha)
+    if strip is not None:
+        return strip
+
+    graphic = content_bbox(alpha)
+    gw = gh = 0
+    if graphic is not None:
+        gw = graphic[2] - graphic[0] + 1
+        gh = graphic[3] - graphic[1] + 1
+
+    best: tuple[int, int, int, int] | None = None
+    best_score = 0.0
+    for x0, y0, x1, y1, bw, bh in _iter_solid_rects(
+        rgb,
+        alpha,
+        max_channel_std=max_channel_std,
+        local_std_max=local_std_max,
+        min_fill_ratio=min_fill_ratio,
+        min_side_px=min_side_px,
+        min_area_px=min_area_px,
+    ):
+        if gw > 0 and gh > 0 and bw >= int(0.85 * gw) and bh >= int(0.85 * gh):
+            continue
+        area = bw * bh
+        score = float(area)
+        if score > best_score:
+            best_score = score
+            best = (x0, y0, x1, y1)
+    return best
 
 
 def _paint_rgb(
@@ -635,6 +732,34 @@ def apply_red_top_marks(
     )
 
 
+def _fill_bar_segments(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    coverage: np.ndarray,
+    white: np.ndarray,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    colors: tuple[tuple[int, int, int], ...],
+    white_ink: int,
+) -> None:
+    """Fill [y0:y1, x0:x1) as equal-width color segments + white underbase."""
+    if y1 <= y0 or x1 <= x0 or not colors:
+        return
+    span = x1 - x0
+    n = len(colors)
+    for i, color in enumerate(colors):
+        sx = x0 + (i * span) // n
+        ex = x0 + ((i + 1) * span) // n
+        if ex <= sx:
+            continue
+        rgb[y0:y1, sx:ex] = color
+        alpha[y0:y1, sx:ex] = 255
+        coverage[y0:y1, sx:ex] = 255
+        white[y0:y1, sx:ex] = white_ink
+
+
 def apply_lead_in_bar(
     rgb: np.ndarray,
     alpha: np.ndarray,
@@ -643,6 +768,7 @@ def apply_lead_in_bar(
     dpi: float,
     polarity: ChannelPolarity = "white_prints",
     content_box: tuple[int, int, int, int] | None = None,
+    include_preheat: bool = False,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -651,12 +777,11 @@ def apply_lead_in_bar(
     tuple[int, int, int, int] | None,
     int,
 ]:
-    """在圖案正下方置中加 4×1 cm 廢墨條（距內容底邊 3mm）；不足則向下／向左右延伸畫布。
+    """圖案正下方置中加 4×1 cm C/M/Y/K Color Block（高度固定）。
 
-    彩墨為 C/M/Y/K 四段實色；白墨為 100% 噴白（跟 polarity）。
-    於 choke／偏移／下端減弱之後套用，避免廢墨條被削弱。
-    content_box：若已加定位線，傳入圖案内容 bbox，避免把標記算進內容範圍。
-    回傳 (planes..., bar_box|None, pad_left)。bar_box 係 C/M/Y/K Color Block 外框。
+    include_preheat：喺 Color Block 頂再加 1/4 高單色預熱條（黑＋紅＋藍融合），
+    唔食色塊高度。距圖案底邊 LEAD_IN_GAP_MM。白墨 100%。
+    回傳 (planes..., color_block_box|None, pad_left)。box 只包 C/M/Y/K。
     """
     bbox = content_box if content_box is not None else content_bbox(alpha)
     if bbox is None:
@@ -666,10 +791,12 @@ def apply_lead_in_bar(
     gap = mm_to_px(LEAD_IN_GAP_MM, dpi)
     bar_w = mm_to_px(LEAD_IN_WIDTH_MM, dpi)
     bar_h = mm_to_px(LEAD_IN_HEIGHT_MM, dpi)
+    preheat_h = max(1, int(round(bar_h * PREHEAT_HEIGHT_RATIO))) if include_preheat else 0
 
     content_cx = (x0 + x1 + 1) / 2.0
     bar_left = int(round(content_cx - bar_w / 2.0))
-    bar_top = int(y1 + 1 + gap)
+    stack_top = int(y1 + 1 + gap)
+    bar_top = stack_top + preheat_h
     bar_right = bar_left + bar_w
     bar_bottom = bar_top + bar_h
 
@@ -684,7 +811,6 @@ def apply_lead_in_bar(
         rgb_n = np.zeros((new_h, new_w, 3), dtype=np.uint8)
         alpha_n = np.zeros((new_h, new_w), dtype=np.uint8)
         coverage_n = np.zeros((new_h, new_w), dtype=np.uint8)
-        # 透明底：white_prints=0；black_prints=255（唔噴白）
         white_n = np.full(
             (new_h, new_w),
             255 if polarity == "black_prints" else 0,
@@ -700,23 +826,25 @@ def apply_lead_in_bar(
 
     h, w = alpha.shape
     bl = max(0, bar_left)
-    bt = max(0, bar_top)
     br = min(w, bar_right)
+    bt = max(0, bar_top)
     bb = min(h, bar_bottom)
     if br <= bl or bb <= bt:
         return rgb, alpha, coverage, white, None, pad_left
 
     white_ink = 0 if polarity == "black_prints" else 255
-    span = br - bl
-    for i, color in enumerate(LEAD_IN_SEGMENT_RGB):
-        sx = bl + (i * span) // 4
-        ex = bl + ((i + 1) * span) // 4
-        if ex <= sx:
-            continue
-        rgb[bt:bb, sx:ex] = color
-        alpha[bt:bb, sx:ex] = 255
-        coverage[bt:bb, sx:ex] = 255
-        white[bt:bb, sx:ex] = white_ink
+    if include_preheat and preheat_h > 0:
+        pt = max(0, stack_top)
+        ph_bottom = min(h, bt)
+        if ph_bottom > pt:
+            rgb[pt:ph_bottom, bl:br] = PREHEAT_RGB
+            alpha[pt:ph_bottom, bl:br] = 255
+            coverage[pt:ph_bottom, bl:br] = 255
+            white[pt:ph_bottom, bl:br] = white_ink
+    _fill_bar_segments(
+        rgb, alpha, coverage, white,
+        bt, bb, bl, br, LEAD_IN_SEGMENT_RGB, white_ink,
+    )
 
     bar_box = (bl, bt, br - 1, bb - 1)
     return (
@@ -757,6 +885,7 @@ def process_artwork(
     white_x_offset_px: int = 0,
     bottom_white_fade: int = 0,
     lead_in_bar: bool = False,
+    preheat_bar: bool = False,
     registration_guides: bool = False,
     red_top_marks: bool = False,
 ) -> ProcessResult:
@@ -773,10 +902,10 @@ def process_artwork(
         rgb, alpha, coverage, white = mirror_planes(rgb, alpha, coverage, white)
     out_dpi = float(dpi_override or dpi)
     graphic = graphic_bbox(alpha)
-    color_block = color_block_bbox(rgb, alpha)
     guides_applied = False
     red_applied = False
     lead_box: tuple[int, int, int, int] | None = None
+    preheat_applied = False
     if lead_in_bar:
         rgb, alpha, coverage, white, lead_box, pad_left = apply_lead_in_bar(
             rgb,
@@ -786,16 +915,14 @@ def process_artwork(
             dpi=out_dpi,
             polarity=polarity,
             content_box=graphic,
+            include_preheat=bool(preheat_bar),
         )
-        if pad_left:
-            if graphic is not None:
-                gx0, gy0, gx1, gy1 = graphic
-                graphic = (gx0 + pad_left, gy0, gx1 + pad_left, gy1)
-            if color_block is not None:
-                cx0, cy0, cx1, cy1 = color_block
-                color_block = (cx0 + pad_left, cy0, cx1 + pad_left, cy1)
-    # Color Block = 底部 C/M/Y/K 色條（廢墨條）；定位線同紅標共用
-    block = lead_box if lead_box is not None else color_block
+        preheat_applied = bool(preheat_bar) and lead_box is not None
+        if pad_left and graphic is not None:
+            gx0, gy0, gx1, gy1 = graphic
+            graphic = (gx0 + pad_left, gy0, gx1 + pad_left, gy1)
+    # Color Block = 圖下端四色（C/M/Y/K）長方形
+    block = lead_box if lead_box is not None else color_block_bbox(rgb, alpha)
     if registration_guides and block is not None:
         rgb, alpha, coverage, white, graphic, block = apply_registration_guides(
             rgb,
@@ -832,6 +959,7 @@ def process_artwork(
         white_x_offset_px=int(white_x_offset_px),
         bottom_white_fade=int(bottom_white_fade),
         lead_in_bar=bool(lead_in_bar),
+        preheat_bar=bool(preheat_applied),
         registration_guides=bool(guides_applied),
         red_top_marks=bool(red_applied),
     )
@@ -1151,7 +1279,9 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
     if result.bottom_white_fade:
         flags.append(f"下端起步白墨減弱 {result.bottom_white_fade}/10（最下約 1/10）")
     if result.lead_in_bar:
-        flags.append("已加底部廢墨條（Lead-in，圖案正下方置中）")
+        flags.append("已加底部 Color Block（C/M/Y/K，貼近圖案）")
+    if result.preheat_bar:
+        flags.append("已加 Color Block 頂單色預熱條（黑＋紅＋藍融合，1/4 高）")
     if result.registration_guides:
         flags.append(
             "已加左右 [ ] 定位線（X=圖案外側 1cm；豎段=底部 C/M/Y/K Color Block；K100+白底；短橫 4mm）"
@@ -1705,8 +1835,16 @@ def render_app() -> None:
             "啟用底部廢墨條 (Lead-in Bar)",
             value=DEFAULT_LEAD_IN_BAR,
             help=(
-                "喺圖案內容最底邊再下 3mm，置中加 4cm×1cm 廢墨條（C/M/Y/K 四段＋100% 白底），"
+                "喺圖案最底邊再下 1mm，置中加 Color Block（4cm×1cm C/M/Y/K，高度固定）＋100% 白底，"
                 "幫噴頭起步打通墨路。會自動加高畫布，預設關閉。"
+            ),
+        )
+        preheat_bar = st.checkbox(
+            "啟用預熱條（Color Block 頂）",
+            value=DEFAULT_PREHEAT_BAR,
+            help=(
+                "喺 Color Block 頂再加 1/4 高單色預熱條（黑＋紅＋藍融合，唔係三段分色）。"
+                "唔食 Color Block 高度。要同時勾廢墨條先畫；唔勾就不畫。"
             ),
         )
         registration_guides = st.checkbox(
@@ -1714,7 +1852,7 @@ def render_app() -> None:
             value=DEFAULT_REGISTRATION_GUIDES,
             help=(
                 "大圖案左右外側 1cm 畫 [ ]："
-                "豎段=底部 C/M/Y/K Color Block 高（廢墨條頂～底）；短橫 4mm；線寬 2px。"
+                "豎段=圖下端四色（C/M/Y/K）長方形高；短橫 4mm；線寬 2px。"
                 "黑墨 K100% + 白通道 100%，方便 RIP 對位同貼 mask tape。"
                 "有色條先畫；冇就不畫，唔會改跟圖案高。"
             ),
@@ -1724,7 +1862,7 @@ def render_app() -> None:
             value=DEFAULT_RED_TOP_MARKS,
             help=(
                 "大圖案左右外側 1cm 各畫約 1cm 紅橫線（朝內；線寬 2px）。"
-                "高度對齊底部 C/M/Y/K Color Block 頂（廢墨條頂邊），唔跟圖案頂。"
+                "高度對齊圖下端四色（C/M/Y/K）長方形頂，唔跟圖案頂。"
                 "紅墨 + 白通道 100%。有色條先畫；冇就不畫。"
             ),
         )
@@ -1790,6 +1928,7 @@ def render_app() -> None:
                     white_x_offset_px=int(white_x_offset_px),
                     bottom_white_fade=int(bottom_white_fade),
                     lead_in_bar=bool(lead_in_bar),
+                    preheat_bar=bool(preheat_bar),
                     registration_guides=bool(registration_guides),
                     red_top_marks=bool(red_top_marks),
                 )
@@ -1840,19 +1979,24 @@ def render_app() -> None:
                     f"x={result.white_x_offset_px:+d}px · "
                     f"bottomFade={result.bottom_white_fade}/10 · "
                     f"leadIn={result.lead_in_bar} · "
+                    f"preheat={result.preheat_bar} · "
                     f"guides={result.registration_guides} · "
                     f"redMarks={result.red_top_marks} · "
                     f"file={stem}_{channel_name}.tif"
                 )
+                if preheat_bar and not lead_in_bar:
+                    st.warning("預熱條要同時勾「啟用底部廢墨條」先畫（疊喺 Color Block 頂）。")
+                elif preheat_bar and not result.preheat_bar:
+                    st.warning("未畫預熱條（要有 Color Block／廢墨條）。")
                 if registration_guides and not result.registration_guides:
                     st.warning(
-                        "未偵測到 Color Block（底部 C/M/Y/K 色條）。"
-                        "勾「啟用底部廢墨條」或原圖要有色條先畫定位線。"
+                        "未偵測到 Color Block（圖下端四色 C/M/Y/K 長方形）。"
+                        "勾「啟用底部廢墨條」或原圖下端要有四色條先畫定位線。"
                     )
                 if red_top_marks and not result.red_top_marks:
                     st.warning(
-                        "未偵測到 Color Block（底部 C/M/Y/K 色條）。"
-                        "勾「啟用底部廢墨條」或原圖要有色條先畫紅標。"
+                        "未偵測到 Color Block（圖下端四色 C/M/Y/K 長方形）。"
+                        "勾「啟用底部廢墨條」或原圖下端要有四色條先畫紅標。"
                     )
                 st.info(
                     "PrintExp：Import 呢個 .tif（檔名已去掉空格/括號）→ white Color → "
@@ -1861,7 +2005,7 @@ def render_app() -> None:
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
                     "若下端起步透白，用「下端起步白墨減弱」；"
                     "若要通墨，勾「啟用底部廢墨條」再下載；"
-                    "定位線／紅標：都跟底部 C/M/Y/K 色條（外側 1cm；[ ] 豎段=色條高；紅橫=色條頂）。"
+                    "定位線／紅標：都跟圖下端四色（C/M/Y/K）長方形（外側 1cm；[ ] 豎段=色塊高；紅橫=色塊頂）。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
