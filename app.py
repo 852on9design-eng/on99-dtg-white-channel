@@ -422,7 +422,7 @@ def apply_registration_guides(
     - 左右 X：圖案最左／最右外側 1cm（GUIDE_OFFSET_MM）
     - 豎段高度 Y：對齊 Color Block 頂～底（唔跟圖案總高）
     - 上下短橫朝內 GUIDE_ARM_MM；線寬 GUIDE_STROKE_PX
-    - 偵測唔到 Color Block → 豎段改跟圖案內容高（仍然畫線，方便貼 mask tape）
+    - 偵測唔到 Color Block → 唔畫（唔改用圖案高）
     回傳 (planes..., graphic_box', color_block_box'|None)。
     """
     graphic = graphic_box if graphic_box is not None else graphic_bbox(alpha)
@@ -431,9 +431,8 @@ def apply_registration_guides(
     color = color_block_box
     if color is None:
         color = color_block_bbox(rgb, alpha)
-    # 無獨立色塊時，高度改跟圖案內容，但定位線仍然要畫
     if color is None:
-        color = graphic
+        return rgb, alpha, coverage, white, graphic, None
 
     gx0, gy0, gx1, gy1 = graphic
     cx0, cy0, cx1, cy1 = color
@@ -635,7 +634,8 @@ def process_artwork(
     out_dpi = float(dpi_override or dpi)
     graphic = graphic_bbox(alpha)
     color_block = color_block_bbox(rgb, alpha)
-    if registration_guides:
+    guides_applied = False
+    if registration_guides and color_block is not None:
         rgb, alpha, coverage, white, graphic, color_block = apply_registration_guides(
             rgb,
             alpha,
@@ -646,6 +646,7 @@ def process_artwork(
             graphic_box=graphic,
             color_block_box=color_block,
         )
+        guides_applied = color_block is not None
     if lead_in_bar:
         rgb, alpha, coverage, white = apply_lead_in_bar(
             rgb,
@@ -668,7 +669,7 @@ def process_artwork(
         white_x_offset_px=int(white_x_offset_px),
         bottom_white_fade=int(bottom_white_fade),
         lead_in_bar=bool(lead_in_bar),
-        registration_guides=bool(registration_guides),
+        registration_guides=bool(guides_applied),
     )
 
 
@@ -1547,7 +1548,7 @@ def render_app() -> None:
                 "大圖案左右外側 1cm 畫 [ ]："
                 "豎段=Color Block 高；短橫 4mm；線寬 2px。"
                 "黑墨 K100% + 白通道 100%，方便 RIP 對位同貼 mask tape。"
-                "有 Color Block 時豎段跟色塊高；無色塊則跟圖案高。一定會畫線方便貼 mask tape。"
+                "有實心 Color Block 先畫（豎段=色塊高）；冇色塊就唔畫，唔會改跟圖案高。"
             ),
         )
         spot_invert_export = st.checkbox(
@@ -1664,6 +1665,8 @@ def render_app() -> None:
                     f"guides={result.registration_guides} · "
                     f"file={stem}_{channel_name}.tif"
                 )
+                if registration_guides and not result.registration_guides:
+                    st.warning("未偵測到 Color Block，冇畫定位線（唔會改用圖案高度）。")
                 st.info(
                     "PrintExp：Import 呢個 .tif（檔名已去掉空格/括號）→ white Color → "
                     "**Data Source Type = Spot**。若仍外框全白，確認反相寫入已開；"
@@ -1671,7 +1674,7 @@ def render_app() -> None:
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
                     "若下端起步透白，用「下端起步白墨減弱」；"
                     "若要通墨，勾「啟用底部廢墨條」再下載；"
-                    "定位線：黑 [ ] + 白底（外側 1cm）。RGB 用棋盤底睇黑線；white 預覽睇白底線。"
+                    "定位線：有 Color Block 先畫黑 [ ] + 白底（外側 1cm；高度=色塊）。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
