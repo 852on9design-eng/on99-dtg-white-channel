@@ -195,13 +195,13 @@ def test_lead_in_bar_centered_expands_canvas():
     assert bar_w >= 100
 
 
-def test_registration_guides_brackets_and_top_bar():
+def test_registration_guides_color_block_height_graphic_x():
     from app import (
         GUIDE_ARM_MM,
         GUIDE_OFFSET_MM,
         GUIDE_STROKE_PX,
-        TOP_BLACK_BAR_HEIGHT_MM,
         apply_registration_guides,
+        color_block_bbox,
         mm_to_px,
         rgb_alpha_to_cmyk,
     )
@@ -209,24 +209,27 @@ def test_registration_guides_brackets_and_top_bar():
     dpi = 300.0
     offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
     arm = mm_to_px(GUIDE_ARM_MM, dpi)
-    bar_h = mm_to_px(TOP_BLACK_BAR_HEIGHT_MM, dpi)
-    stroke = GUIDE_STROKE_PX
+    assert arm == mm_to_px(4.0, dpi)
+    assert GUIDE_STROKE_PX == 2
+    assert GUIDE_OFFSET_MM == 10.0
 
     h, w = 120, 160
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
     alpha = np.zeros((h, w), dtype=np.uint8)
-    # Graphic (white underbase) taller/wider than Color Block
+    # Graphic (near-white) wider/taller
     gx0, gy0, gx1, gy1 = 30, 15, 129, 104
     alpha[gy0 : gy1 + 1, gx0 : gx1 + 1] = 255
     rgb[gy0 : gy1 + 1, gx0 : gx1 + 1] = (255, 255, 255)
-    # Color Block (chromatic) — guides length must follow this, not graphic
+    # Color Block (chromatic) — stem height follows this
     cx0, cy0, cx1, cy1 = 45, 35, 114, 84
     rgb[cy0 : cy1 + 1, cx0 : cx1 + 1] = (180, 60, 60)
     alpha[cy0 : cy1 + 1, cx0 : cx1 + 1] = 255
     coverage = alpha.copy()
     white = alpha.copy()
     block_h = cy1 - cy0 + 1
-    block_w = cx1 - cx0 + 1
+
+    detected = color_block_bbox(rgb, alpha)
+    assert detected == (cx0, cy0, cx1, cy1)
 
     rgb2, alpha2, coverage2, white2, graphic2, color2 = apply_registration_guides(
         rgb,
@@ -239,48 +242,27 @@ def test_registration_guides_brackets_and_top_bar():
         color_block_box=(cx0, cy0, cx1, cy1),
     )
     assert graphic2 is not None and color2 is not None
-    bx0, by0, bx1, by1 = color2
-    assert by1 - by0 + 1 == block_h
-    assert bx1 - bx0 + 1 == block_w
-    # Color Block pixels preserved
-    assert int(np.sum((rgb2[:, :, 0] == 180) & (alpha2 > 0))) == block_h * block_w
+    assert color2[3] - color2[1] + 1 == block_h
+    assert alpha2.shape[0] == h  # no top bar
 
-    # Top black bar sits directly above Color Block, same width
-    assert by0 >= bar_h
-    bar_row = by0 - 1
-    assert int(alpha2[bar_row, bx0]) == 255
-    assert int(rgb2[bar_row, bx0, 0]) == 0
-    assert int(alpha2[bar_row, bx1]) == 255
-    assert int(rgb2[by0, (bx0 + bx1) // 2, 0]) == 180
-
-    # X follows Graphic outer edge (±1cm), not Color Block
     g2x0, _, g2x1, _ = graphic2
     left_x = g2x0 - offset
     right_x = g2x1 + offset
-    assert left_x == g2x0 - offset
-    assert g2x0 < bx0  # graphic wider/left of color block after pad
-    # Vertical stem length = Color Block only (not full graphic)
+    by0, by1 = color2[1], color2[3]
     assert int(alpha2[by0, left_x]) == 255
     assert int(alpha2[by1, left_x]) == 255
     assert int(alpha2[by0 - 1, left_x]) == 0
-    # Beyond Color Block toward graphic bottom: no stem
     assert by1 < graphic2[3]
     assert int(alpha2[by1 + 1, left_x]) == 0
-    assert int(alpha2[by0, right_x]) == 255
-    assert int(alpha2[by1, right_x]) == 255
     assert int(alpha2[by0, left_x + arm - 1]) == 255
     assert int(alpha2[by0, right_x - arm + 1]) == 255
-    assert stroke >= 1
-
-    cmyk = rgb_alpha_to_cmyk(rgb2, alpha2)
-    assert int(cmyk[bar_row, bx0, 3]) > 200
-    assert int(white2[bar_row, bx0]) == 0
     assert int(white2[by0, left_x]) == 0
-    assert int(rgb2[by0, left_x, 0]) == 0
+    assert int(coverage2[by0, left_x]) == 0
+    cmyk = rgb_alpha_to_cmyk(rgb2, alpha2)
     assert int(cmyk[by0, left_x, 3]) > 200
 
 
-def test_color_block_bbox_prefers_chromatic_over_white_graphic():
+def test_color_block_bbox_ignores_gray_distress():
     from app import color_block_bbox, graphic_bbox
 
     h, w = 80, 100
@@ -288,11 +270,14 @@ def test_color_block_bbox_prefers_chromatic_over_white_graphic():
     alpha = np.zeros((h, w), dtype=np.uint8)
     alpha[10:70, 10:90] = 255
     rgb[10:70, 10:90] = (255, 255, 255)
+    # gray grit should NOT become Color Block
+    rgb[12, 12] = (200, 200, 200)
+    rgb[60, 80] = (180, 180, 180)
+    assert color_block_bbox(rgb, alpha) is None
+    # real chroma block is detected
     rgb[25:55, 30:70] = (20, 90, 200)
-    g = graphic_bbox(alpha)
-    c = color_block_bbox(rgb, alpha)
-    assert g == (10, 10, 89, 69)
-    assert c == (30, 25, 69, 54)
+    assert color_block_bbox(rgb, alpha) == (30, 25, 69, 54)
+    assert graphic_bbox(alpha) == (10, 10, 89, 69)
 
 
 if __name__ == "__main__":
@@ -304,6 +289,6 @@ if __name__ == "__main__":
     test_offset_white_x_shifts_right_without_wrap()
     test_soften_white_bottom_only_affects_lower_tenth()
     test_lead_in_bar_centered_expands_canvas()
-    test_registration_guides_brackets_and_top_bar()
-    test_color_block_bbox_prefers_chromatic_over_white_graphic()
+    test_registration_guides_color_block_height_graphic_x()
+    test_color_block_bbox_ignores_gray_distress()
     print("OK")

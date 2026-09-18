@@ -66,12 +66,11 @@ LEAD_IN_SEGMENT_RGB = (
     (255, 242, 0),    # Y
     (0, 0, 0),        # K
 )
-# Color Block 外側定位括號 [ ] + 頂部 K100% 黑條（不壓縮 Color Block）
+# 圖案外側定位括號 [ ]（K100% 黑墨、唔打白底）
 DEFAULT_REGISTRATION_GUIDES = True
 GUIDE_OFFSET_MM = 10.0  # 圖案左右外側 1 cm
 GUIDE_STROKE_PX = 2
 GUIDE_ARM_MM = 4.0  # [ ] 上下短橫朝內
-TOP_BLACK_BAR_HEIGHT_MM = 3.0
 DEFAULT_DPI = 300
 MAX_PREVIEW_EDGE = 640
 WHITE_NAME_ALIASES = {
@@ -292,7 +291,7 @@ def content_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
 
 
 def graphic_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
-    """整體圖案（Graphic）外框：用不透明 Alpha，左右定位線 X 跟呢個。"""
+    """整體圖案（Graphic）外框：左右定位線 X 跟呢個。"""
     return content_bbox(alpha)
 
 
@@ -300,55 +299,30 @@ def color_block_bbox(
     rgb: np.ndarray,
     alpha: np.ndarray,
     *,
-    near_white: int = 250,
-    min_row_fill_ratio: float = 0.35,
+    min_chroma: int = 25,
+    near_black: int = 48,
 ) -> tuple[int, int, int, int] | None:
-    """Color Block 外框：定位線長度（Y）同頂部黑條闊度跟呢個。
+    """Color Block 外框：定位線豎段長度（Y）跟呢個。
 
-    優先用不透明且非近白嘅彩墨像素；若圖係近白／白墨主體，
-    則用「主體實心列」估計（去掉甩色滴墨等稀疏尖角），避免跟晒成個圖案高度。
+    用有彩度（或實黑 K）嘅不透明像素；唔計近白／灰色甩色噪點。
+    若偵測唔到獨立色塊，回傳 None（呼叫端改用圖案內容高）。
     """
     alpha_u = np.asarray(alpha)
     opaque = alpha_u > 0
     if not np.any(opaque):
         return None
-
     rgb_u = np.asarray(rgb)
-    if rgb_u.ndim == 3 and rgb_u.shape[:2] == alpha_u.shape:
-        nw = (
-            (rgb_u[:, :, 0] >= near_white)
-            & (rgb_u[:, :, 1] >= near_white)
-            & (rgb_u[:, :, 2] >= near_white)
-        )
-        color = opaque & ~nw
-        if np.any(color):
-            return content_bbox(color.astype(np.uint8) * 255)
-
-    return _dense_body_bbox(alpha_u, min_row_fill_ratio=min_row_fill_ratio)
-
-
-def _dense_body_bbox(
-    alpha: np.ndarray,
-    min_row_fill_ratio: float = 0.35,
-) -> tuple[int, int, int, int] | None:
-    """由 Alpha 主體實心列估計 Color Block（忽略上下稀疏甩色／滴墨）。"""
-    opaque = np.asarray(alpha) > 0
-    if not np.any(opaque):
+    if rgb_u.ndim != 3 or rgb_u.shape[:2] != alpha_u.shape:
         return None
-    row_counts = opaque.sum(axis=1)
-    peak = int(row_counts.max())
-    if peak <= 0:
+    mx = rgb_u.max(axis=2)
+    mn = rgb_u.min(axis=2)
+    chroma = mx.astype(np.int16) - mn.astype(np.int16)
+    chromatic = opaque & (chroma >= int(min_chroma))
+    solid_k = opaque & (mx <= int(near_black))
+    mask = chromatic | solid_k
+    if not np.any(mask):
         return None
-    threshold = max(1, int(np.ceil(peak * float(min_row_fill_ratio))))
-    solid_rows = np.where(row_counts >= threshold)[0]
-    if solid_rows.size == 0:
-        return content_bbox(alpha)
-    y0 = int(solid_rows.min())
-    y1 = int(solid_rows.max())
-    cols = np.where(opaque[y0 : y1 + 1].any(axis=0))[0]
-    if cols.size == 0:
-        return content_bbox(alpha)
-    return int(cols.min()), y0, int(cols.max()), y1
+    return content_bbox(mask.astype(np.uint8) * 255)
 
 
 def _paint_k100(
@@ -362,7 +336,7 @@ def _paint_k100(
     x1: int,
     polarity: ChannelPolarity,
 ) -> None:
-    """Fill inclusive-exclusive [y0:y1, x0:x1) with K100% black only（唔打白底）."""
+    """Fill inclusive-exclusive [y0:y1, x0:x1) with K100% black only（唔打白底）。"""
     if y1 <= y0 or x1 <= x0:
         return
     h, w = alpha.shape
@@ -370,11 +344,11 @@ def _paint_k100(
     xx0, xx1 = max(0, x0), min(w, x1)
     if yy1 <= yy0 or xx1 <= xx0:
         return
-    # 定位線／頂部黑條只噴黑墨：white_prints 白通道=0；black_prints 白通道=255（唔噴白）
+    # 只噴黑墨：白通道唔出白；coverage=0 避免「退地覆蓋」預覽誤顯示成白塊
     no_white = 255 if polarity == "black_prints" else 0
     rgb[yy0:yy1, xx0:xx1] = (0, 0, 0)
     alpha[yy0:yy1, xx0:xx1] = 255
-    coverage[yy0:yy1, xx0:xx1] = 255
+    coverage[yy0:yy1, xx0:xx1] = 0
     white[yy0:yy1, xx0:xx1] = no_white
 
 
@@ -395,26 +369,25 @@ def apply_registration_guides(
     tuple[int, int, int, int] | None,
     tuple[int, int, int, int] | None,
 ]:
-    """圖案外側 1cm 畫 [ ] 定位括號，Color Block 正上方加 K100% 橫黑條。
+    """圖案左右外側 1cm 畫 [ ] 定位括號（K100% 黑墨，無頂部黑條）。
 
-    - 左右 X：跟整體圖案（Graphic）最左／最右外側 1cm
-    - 定位線長度／Y：只對齊 Color Block 頂～底（不含頂部黑條）
-    - 頂部黑條：貼 Color Block 頂邊、與 Color Block 等寬；向上擴畫布，不壓縮
-    回傳 (planes..., graphic_box', color_block_box')，座標已含 padding。
+    - 左右 X：圖案最左／最右外側 1cm
+    - 豎段高度 Y：對齊 Color Block 頂～底
+    - 上下短橫朝內 GUIDE_ARM_MM；線寬 GUIDE_STROKE_PX
+    回傳 (planes..., graphic_box', color_block_box')。
     """
     graphic = graphic_box if graphic_box is not None else graphic_bbox(alpha)
-    color = color_block_box if color_block_box is not None else color_block_bbox(rgb, alpha)
     if graphic is None:
         return rgb, alpha, coverage, white, None, None
+    color = color_block_box
     if color is None:
-        color = graphic
+        color = color_block_bbox(rgb, alpha) or graphic
 
     gx0, gy0, gx1, gy1 = graphic
-    cx0, cy0, cx1, cy1 = color
+    _cx0, cy0, _cx1, cy1 = color
     offset = mm_to_px(GUIDE_OFFSET_MM, dpi)
     arm = mm_to_px(GUIDE_ARM_MM, dpi)
     stroke = max(1, int(GUIDE_STROKE_PX))
-    bar_h = mm_to_px(TOP_BLACK_BAR_HEIGHT_MM, dpi)
 
     left_x = gx0 - offset
     right_x = gx1 + offset
@@ -422,42 +395,29 @@ def apply_registration_guides(
     h, w = alpha.shape
     pad_left = max(0, -left_x)
     pad_right = max(0, right_x + 1 - w)
-    pad_top = max(0, bar_h - cy0)
 
-    if pad_left or pad_right or pad_top:
-        new_h = h + pad_top
+    if pad_left or pad_right:
         new_w = w + pad_left + pad_right
-        rgb_n = np.zeros((new_h, new_w, 3), dtype=np.uint8)
-        alpha_n = np.zeros((new_h, new_w), dtype=np.uint8)
-        coverage_n = np.zeros((new_h, new_w), dtype=np.uint8)
+        rgb_n = np.zeros((h, new_w, 3), dtype=np.uint8)
+        alpha_n = np.zeros((h, new_w), dtype=np.uint8)
+        coverage_n = np.zeros((h, new_w), dtype=np.uint8)
         white_n = np.full(
-            (new_h, new_w),
+            (h, new_w),
             255 if polarity == "black_prints" else 0,
             dtype=np.uint8,
         )
-        rgb_n[pad_top : pad_top + h, pad_left : pad_left + w] = rgb
-        alpha_n[pad_top : pad_top + h, pad_left : pad_left + w] = alpha
-        coverage_n[pad_top : pad_top + h, pad_left : pad_left + w] = coverage
-        white_n[pad_top : pad_top + h, pad_left : pad_left + w] = white
+        rgb_n[:h, pad_left : pad_left + w] = rgb
+        alpha_n[:h, pad_left : pad_left + w] = alpha
+        coverage_n[:h, pad_left : pad_left + w] = coverage
+        white_n[:h, pad_left : pad_left + w] = white
         rgb, alpha, coverage, white = rgb_n, alpha_n, coverage_n, white_n
         gx0 += pad_left
         gx1 += pad_left
-        gy0 += pad_top
-        gy1 += pad_top
-        cx0 += pad_left
-        cx1 += pad_left
-        cy0 += pad_top
-        cy1 += pad_top
         left_x += pad_left
         right_x += pad_left
+        color = (color[0] + pad_left, cy0, color[2] + pad_left, cy1)
 
-    # 頂部黑條：貼 Color Block 頂邊，等寬，不重疊 Color Block
-    _paint_k100(
-        rgb, alpha, coverage, white,
-        cy0 - bar_h, cy0, cx0, cx1 + 1, polarity,
-    )
-
-    # 左 `[`：豎線長度 = Color Block 高度；X = 圖案外側
+    # 左 `[`：豎段高度 = Color Block；短橫朝內
     _paint_k100(
         rgb, alpha, coverage, white,
         cy0, cy1 + 1, left_x, left_x + stroke, polarity,
@@ -491,7 +451,7 @@ def apply_registration_guides(
         np.ascontiguousarray(coverage),
         np.ascontiguousarray(white),
         (gx0, gy0, gx1, gy1),
-        (cx0, cy0, cx1, cy1),
+        (color[0], cy0, color[2], cy1),
     )
 
 
@@ -508,7 +468,7 @@ def apply_lead_in_bar(
 
     彩墨為 C/M/Y/K 四段實色；白墨為 100% 噴白（跟 polarity）。
     於 choke／偏移／下端減弱之後套用，避免廢墨條被削弱。
-    content_box：若已加定位線／頂部黑條，傳入 Color Block bbox，避免把標記算進內容範圍。
+    content_box：若已加定位線，傳入圖案内容 bbox，避免把標記算進內容範圍。
     """
     bbox = content_box if content_box is not None else content_bbox(alpha)
     if bbox is None:
@@ -976,7 +936,9 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
     if result.lead_in_bar:
         flags.append("已加底部廢墨條（Lead-in，圖案正下方置中）")
     if result.registration_guides:
-        flags.append("已加左右 [ ] 定位線（X=圖案外側 1cm，長度=Color Block）＋頂部黑條")
+        flags.append(
+            "已加左右 [ ] 定位線（外側 1cm；豎段=Color Block；短橫 4mm；線寬 2px）"
+        )
     if result.mirror_horizontal:
         flags.append("已水平鏡像")
     if result.spot_invert_export:
@@ -1527,12 +1489,12 @@ def render_app() -> None:
             ),
         )
         registration_guides = st.checkbox(
-            "啟用定位線 [ ] + 頂部黑條",
+            "啟用定位線 [ ]",
             value=DEFAULT_REGISTRATION_GUIDES,
             help=(
-                "左右 X：圖案最外側 ±1cm；定位線長度（Y）對齊 Color Block 頂～底；"
-                f"Color Block 正上方加 {TOP_BLACK_BAR_HEIGHT_MM:g}mm K100% 黑條（等寬、不壓縮）。"
-                "定位線同頂部黑條只噴黑墨，唔打白底。"
+                "左右外側 1cm 畫 [ ]："
+                "豎段高度=Color Block；上下短橫朝內 4mm；線寬 2px。"
+                "只噴 K100% 黑墨，唔打白底；無頂部黑條。"
             ),
         )
         spot_invert_export = st.checkbox(
@@ -1656,7 +1618,7 @@ def render_app() -> None:
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
                     "若下端起步透白，用「下端起步白墨減弱」；"
                     "若要通墨，勾「啟用底部廢墨條」再下載；"
-                    "Color Block 對位用左右 [ ]（外側 1cm）同頂部黑條。"
+                    "對位用左右 [ ]（外側 1cm；豎段=Color Block；短橫 4mm）。"
                 )
             except Exception as exc:
                 st.error(f"無法處理這張圖：{exc}")
