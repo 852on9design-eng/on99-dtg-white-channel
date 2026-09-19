@@ -9,6 +9,7 @@
 - 再用 **Choke** 略收，避免白邊露出彩墨。
 - 可選 **白墨水平偏移 (X)**：只移白墨通道對齊面層套準（正數往右；預設 0）。
 - 可選 **下端起步白墨減弱**：只減弱全圖最下約 1/10 區白墨濃度（噴頭剛起步露白時用；預設 0）。
+- 可選 **四邊裁切**：自動裁到圖案四邊（透明邊去掉）；之後先加 Color Block／定位線／紅標。
 - 可選 **底部廢墨條 (Lead-in Bar)**：圖案正下方貼近加 Color Block（4×1 cm C/M/Y/K）。
 - 可選 **預熱條**：Color Block 頂再加 1/4 高單色條（黑＋紅＋藍融合）；唔勾就不畫，色塊高度唔變。
 - 可選 **定位線 [ ]／紅標橫線**：X=大圖案外側 1cm；高度跟底部 C/M/Y/K Color Block（廢墨條）。
@@ -57,6 +58,7 @@ DEFAULT_CHOKE_PX = 2
 DEFAULT_WHITE_X_OFFSET_PX = 0
 DEFAULT_BOTTOM_WHITE_FADE = 0
 BOTTOM_WHITE_FADE_BAND_RATIO = 0.1  # 全圖最下約 1/10
+DEFAULT_CROP_TO_EDGES = False
 DEFAULT_LEAD_IN_BAR = False
 DEFAULT_PREHEAT_BAR = False
 LEAD_IN_GAP_MM = 1.0  # 貼近圖案（舊 3mm）；預熱條再夾喺圖案同 Color Block 之間
@@ -113,6 +115,7 @@ class ProcessResult:
     spot_invert_export: bool = False
     white_x_offset_px: int = 0
     bottom_white_fade: int = 0
+    crop_to_edges: bool = False
     lead_in_bar: bool = False
     preheat_bar: bool = False
     registration_guides: bool = False
@@ -304,6 +307,37 @@ def content_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
     if xs.size == 0:
         return None
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def crop_to_content_edges(
+    rgb: np.ndarray,
+    alpha: np.ndarray,
+    coverage: np.ndarray,
+    white: np.ndarray,
+    content_box: tuple[int, int, int, int] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+    """四邊裁到不透明圖案邊緣（含原圖 Color Block）；透明邊去掉。"""
+    box = content_box if content_box is not None else content_bbox(alpha)
+    if box is None:
+        return rgb, alpha, coverage, white, False
+    x0, y0, x1, y1 = box
+    h, w = alpha.shape
+    if x0 == 0 and y0 == 0 and x1 == w - 1 and y1 == h - 1:
+        return (
+            np.ascontiguousarray(rgb),
+            np.ascontiguousarray(alpha),
+            np.ascontiguousarray(coverage),
+            np.ascontiguousarray(white),
+            True,
+        )
+    sl = (slice(y0, y1 + 1), slice(x0, x1 + 1))
+    return (
+        np.ascontiguousarray(rgb[sl]),
+        np.ascontiguousarray(alpha[sl]),
+        np.ascontiguousarray(coverage[sl]),
+        np.ascontiguousarray(white[sl]),
+        True,
+    )
 
 
 def graphic_bbox(alpha: np.ndarray) -> tuple[int, int, int, int] | None:
@@ -884,6 +918,7 @@ def process_artwork(
     spot_invert_export: bool = True,
     white_x_offset_px: int = 0,
     bottom_white_fade: int = 0,
+    crop_to_edges: bool = False,
     lead_in_bar: bool = False,
     preheat_bar: bool = False,
     registration_guides: bool = False,
@@ -901,6 +936,11 @@ def process_artwork(
     if mirror_horizontal:
         rgb, alpha, coverage, white = mirror_planes(rgb, alpha, coverage, white)
     out_dpi = float(dpi_override or dpi)
+    crop_applied = False
+    if crop_to_edges:
+        rgb, alpha, coverage, white, crop_applied = crop_to_content_edges(
+            rgb, alpha, coverage, white
+        )
     graphic = graphic_bbox(alpha)
     guides_applied = False
     red_applied = False
@@ -958,6 +998,7 @@ def process_artwork(
         spot_invert_export=spot_invert_export,
         white_x_offset_px=int(white_x_offset_px),
         bottom_white_fade=int(bottom_white_fade),
+        crop_to_edges=bool(crop_applied),
         lead_in_bar=bool(lead_in_bar),
         preheat_bar=bool(preheat_applied),
         registration_guides=bool(guides_applied),
@@ -1278,6 +1319,8 @@ def document_from_process(result: ProcessResult, channel_name: str) -> ChannelDo
         flags.append(f"白墨水平偏移 {result.white_x_offset_px:+d} px（{direction}）")
     if result.bottom_white_fade:
         flags.append(f"下端起步白墨減弱 {result.bottom_white_fade}/10（最下約 1/10）")
+    if result.crop_to_edges:
+        flags.append("已四邊裁切至圖案邊緣")
     if result.lead_in_bar:
         flags.append("已加底部 Color Block（C/M/Y/K，貼近圖案）")
     if result.preheat_bar:
@@ -1831,6 +1874,14 @@ def render_app() -> None:
                 "上半圖唔變。0＝唔減，建議 3–6。"
             ),
         )
+        crop_to_edges = st.checkbox(
+            "啟用四邊裁切至圖案邊緣",
+            value=DEFAULT_CROP_TO_EDGES,
+            help=(
+                "自動裁走圖案四邊多餘透明底，畫布貼到不透明內容邊緣。"
+                "之後先加廢墨條／預熱條／定位線／紅標（唔會裁走呢啲標記）。預設關閉。"
+            ),
+        )
         lead_in_bar = st.checkbox(
             "啟用底部廢墨條 (Lead-in Bar)",
             value=DEFAULT_LEAD_IN_BAR,
@@ -1927,6 +1978,7 @@ def render_app() -> None:
                     spot_invert_export=bool(spot_invert_export),
                     white_x_offset_px=int(white_x_offset_px),
                     bottom_white_fade=int(bottom_white_fade),
+                    crop_to_edges=bool(crop_to_edges),
                     lead_in_bar=bool(lead_in_bar),
                     preheat_bar=bool(preheat_bar),
                     registration_guides=bool(registration_guides),
@@ -1978,6 +2030,7 @@ def render_app() -> None:
                     f"mirror={result.mirror_horizontal} · "
                     f"x={result.white_x_offset_px:+d}px · "
                     f"bottomFade={result.bottom_white_fade}/10 · "
+                    f"crop={result.crop_to_edges} · "
                     f"leadIn={result.lead_in_bar} · "
                     f"preheat={result.preheat_bar} · "
                     f"guides={result.registration_guides} · "
@@ -2004,6 +2057,7 @@ def render_app() -> None:
                     "若左右相反，打開「水平鏡像」再下載；"
                     "若白墨偏左露鬼影，用「白墨水平偏移 (X)」正數微調再下載；"
                     "若下端起步透白，用「下端起步白墨減弱」；"
+                    "四邊多餘透明底可勾「四邊裁切至圖案邊緣」；"
                     "若要通墨，勾「啟用底部廢墨條」再下載；"
                     "定位線／紅標：都跟圖下端四色（C/M/Y/K）長方形（外側 1cm；[ ] 豎段=色塊高；紅橫=色塊頂）。"
                 )

@@ -595,6 +595,51 @@ def test_white_only_art_no_red_marks():
     assert int(alpha2.sum()) == int(alpha.sum())
 
 
+def test_crop_to_content_edges_four_sides():
+    from app import crop_to_content_edges, process_artwork
+    from PIL import Image
+    import io
+
+    h, w = 80, 100
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    alpha = np.zeros((h, w), dtype=np.uint8)
+    rgb[20:50, 30:70] = (10, 20, 30)
+    alpha[20:50, 30:70] = 255
+    rgb2, a2, c2, w2, applied = crop_to_content_edges(
+        rgb, alpha, alpha.copy(), alpha.copy()
+    )
+    assert applied
+    assert a2.shape == (30, 40)
+    assert np.array_equal(rgb2, rgb[20:50, 30:70])
+    # already tight → still applied, size unchanged
+    rgb3, a3, _c3, _w3, applied2 = crop_to_content_edges(rgb2, a2, c2, w2)
+    assert applied2
+    assert a3.shape == a2.shape
+
+    empty = np.zeros((10, 10), dtype=np.uint8)
+    _r, _a, _c, _wh, applied3 = crop_to_content_edges(
+        np.zeros((10, 10, 3), dtype=np.uint8), empty, empty, empty
+    )
+    assert not applied3
+
+    canvas = np.zeros((60, 80, 4), dtype=np.uint8)
+    canvas[15:40, 10:55, :3] = (80, 40, 20)
+    canvas[15:40, 10:55, 3] = 255
+    buf = io.BytesIO()
+    Image.fromarray(canvas).save(buf, format="PNG")
+    result = process_artwork(
+        buf.getvalue(),
+        "crop.png",
+        choke_px=0,
+        polarity="white_prints",
+        dpi_override=300.0,
+        spot_invert_export=False,
+        crop_to_edges=True,
+    )
+    assert result.crop_to_edges
+    assert result.alpha.shape == (25, 45)
+
+
 if __name__ == "__main__":
     test_default_cmyk_spot_named_white()
     test_rgb_spot_mode()
@@ -613,4 +658,5 @@ if __name__ == "__main__":
     test_white_only_art_no_guides()
     test_red_marks_x_on_graphic_y_on_color_block_top()
     test_white_only_art_no_red_marks()
+    test_crop_to_content_edges_four_sides()
     print("OK")
