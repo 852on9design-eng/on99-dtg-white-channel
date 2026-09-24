@@ -90,6 +90,43 @@ def test_spot_invert_and_mirror_helpers():
     assert int(inv[0, 0]) == 245
 
 
+def test_choke_half_step_shrinks_white_only():
+    from app import choke_grayscale, process_artwork
+    from PIL import Image
+    import io
+
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[8:32, 8:32] = 255
+    full = choke_grayscale(mask, 0)
+    half = choke_grayscale(mask, 0.5)
+    one = choke_grayscale(mask, 1)
+    two = choke_grayscale(mask, 2.0)
+    assert np.array_equal(full, mask)
+    assert np.array_equal(two, choke_grayscale(mask, 2))
+    assert int(half.sum()) < int(full.sum())
+    assert int(half.sum()) > int(one.sum())
+
+    canvas = np.zeros((48, 48, 4), dtype=np.uint8)
+    canvas[10:38, 10:38, :3] = (200, 30, 40)
+    canvas[10:38, 10:38, 3] = 255
+    buf = io.BytesIO()
+    Image.fromarray(canvas).save(buf, format="PNG")
+    png = buf.getvalue()
+    none = process_artwork(png, "c.png", choke_px=0, polarity="white_prints", dpi_override=300)
+    a = process_artwork(png, "c.png", choke_px=0.5, polarity="white_prints", dpi_override=300)
+    b = process_artwork(png, "c.png", choke_px=2.5, polarity="white_prints", dpi_override=300)
+    from tiff_export import rgb_alpha_to_cmyk
+
+    cmyk_none = rgb_alpha_to_cmyk(none.rgb, none.alpha)
+    cmyk_half = rgb_alpha_to_cmyk(a.rgb, a.alpha)
+    cmyk_far = rgb_alpha_to_cmyk(b.rgb, b.alpha)
+    assert np.array_equal(cmyk_none, cmyk_half)
+    assert np.array_equal(cmyk_none, cmyk_far)
+    assert np.array_equal(a.rgb, b.rgb)
+    assert np.array_equal(a.alpha, b.alpha)
+    assert int(b.white.sum()) < int(a.white.sum())
+
+
 def test_offset_white_x_shifts_right_without_wrap():
     from app import offset_white_x
 
@@ -646,6 +683,7 @@ if __name__ == "__main__":
     test_legacy_is_not_spot()
     test_safe_download_stem_strips_parens()
     test_spot_invert_and_mirror_helpers()
+    test_choke_half_step_shrinks_white_only()
     test_offset_white_x_shifts_right_without_wrap()
     test_soften_white_bottom_only_affects_lower_tenth()
     test_lead_in_bar_centered_expands_canvas()

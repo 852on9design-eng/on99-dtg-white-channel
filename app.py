@@ -6,7 +6,7 @@
   - 退地／透明 → 不打白
   - 甩色破洞（透明）→ 不打白（照原圖，不補白）
   - 彩墨 **同黑墨**（含下端黑字、勾線）→ **都要打白底**
-- 再用 **Choke** 略收，避免白邊露出彩墨。
+- 再用 **Choke** 略收白墨（可 0.5），避免白邊露出彩墨。CMYK 面層四色唔收。
 - 可選 **白墨水平偏移 (X)**：只移白墨通道對齊面層套準（正數往右；預設 0）。
 - 可選 **下端起步白墨減弱**：只減弱全圖最下約 1/10 區白墨濃度（噴頭剛起步露白時用；預設 0）。
 - 可選 **四邊裁切**：自動裁到圖案四邊（透明邊去掉）；之後先加 Color Block／定位線／紅標。
@@ -238,11 +238,8 @@ def ink_coverage(alpha: np.ndarray) -> np.ndarray:
     return alpha.astype(np.uint8, copy=True)
 
 
-def choke_grayscale(mask: np.ndarray, pixels: int) -> np.ndarray:
-    """Choke：向內侵蝕 N px，略縮白墨底，避免白邊露出彩墨。"""
-    mask = mask.astype(np.uint8, copy=False)
-    if pixels <= 0:
-        return mask
+def _erode_px(mask: np.ndarray, pixels: int) -> np.ndarray:
+    """整數像素灰度侵蝕。只用於白墨，唔改 RGB／CMYK。"""
     size = 2 * int(pixels) + 1
     try:
         import cv2
@@ -251,6 +248,28 @@ def choke_grayscale(mask: np.ndarray, pixels: int) -> np.ndarray:
         return cv2.erode(mask, kernel, iterations=1)
     except Exception:
         return np.array(Image.fromarray(mask).filter(ImageFilter.MinFilter(size)))
+
+
+def _erode_half_px(mask: np.ndarray) -> np.ndarray:
+    """半像素內縮：2× 最近鄰放大、侵蝕 1px、再平均縮回。"""
+    up = np.repeat(np.repeat(mask, 2, axis=0), 2, axis=1)
+    eroded = _erode_px(up, 1)
+    h, w = mask.shape[:2]
+    blocks = eroded.reshape(h, 2, w, 2).astype(np.float32)
+    return np.clip(np.rint(blocks.mean(axis=(1, 3))), 0, 255).astype(np.uint8)
+
+
+def choke_grayscale(mask: np.ndarray, pixels: float) -> np.ndarray:
+    """Choke：只向內收白墨。整數 px 同舊行為；另可加 0.5。唔改 CMYK 面層。"""
+    mask = np.asarray(mask, dtype=np.uint8)
+    if pixels <= 0:
+        return mask
+    whole = int(pixels)
+    if whole > 0:
+        mask = _erode_px(mask, whole)
+    if pixels - whole >= 0.25:
+        mask = _erode_half_px(mask)
+    return mask
 
 
 def offset_white_x(mask: np.ndarray, dx_px: int) -> np.ndarray:
@@ -893,7 +912,7 @@ def apply_lead_in_bar(
 
 def build_white_channel(
     alpha: np.ndarray,
-    choke_px: int,
+    choke_px: float,
     polarity: ChannelPolarity,
     white_x_offset_px: int = 0,
     bottom_white_fade: int = 0,
@@ -911,7 +930,7 @@ def build_white_channel(
 def process_artwork(
     file_bytes: bytes,
     filename: str,
-    choke_px: int,
+    choke_px: float,
     polarity: ChannelPolarity,
     dpi_override: float | None = None,
     mirror_horizontal: bool = False,
@@ -1847,10 +1866,11 @@ def render_app() -> None:
 
         choke_px = st.slider(
             "白墨內縮標桿 (Choke)",
-            min_value=0,
-            max_value=10,
-            value=DEFAULT_CHOKE_PX,
-            help="略縮白墨，避免白邊露出彩墨。甩色圖建議 2–3。",
+            min_value=0.0,
+            max_value=10.0,
+            value=float(DEFAULT_CHOKE_PX),
+            step=0.5,
+            help="只收白墨通道，CMYK 面層四色唔變。每格 0.5。略縮白墨，避免白邊露出彩墨。甩色圖建議 2–3。",
         )
         white_x_offset_px = st.slider(
             "白墨水平偏移 (X)",
@@ -1971,7 +1991,7 @@ def render_app() -> None:
                 result = process_artwork(
                     file_bytes=source.getvalue(),
                     filename=source.name,
-                    choke_px=int(choke_px),
+                    choke_px=float(choke_px),
                     polarity=polarity,  # type: ignore[arg-type]
                     dpi_override=float(dpi_override),
                     mirror_horizontal=bool(mirror_horizontal),
