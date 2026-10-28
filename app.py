@@ -31,8 +31,10 @@ from __future__ import annotations
 import base64
 import html
 import io
+import json
 import struct
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -88,6 +90,9 @@ DEFAULT_RED_TOP_MARKS = False
 RED_MARK_LENGTH_MM = 10.0  # 約 1 cm
 RED_MARK_RGB = (255, 0, 0)
 DEFAULT_DPI = 300
+DEFAULT_SPOT_INVERT_EXPORT = True
+DEFAULT_MIRROR_HORIZONTAL = False
+PRESETS_PATH = Path(__file__).with_name("presets.json")
 MAX_PREVIEW_EDGE = 640
 WHITE_NAME_ALIASES = {
     "w1",
@@ -120,6 +125,8 @@ class ProcessResult:
     preheat_bar: bool = False
     registration_guides: bool = False
     red_top_marks: bool = False
+    two_station_preserve_red: bool = False
+    preserve_red_strength: float = 0.0
 
 
 def mirror_planes(
@@ -226,6 +233,40 @@ def flatten_rgb(rgba: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     alpha = rgba[..., 3].copy()
     rgb[alpha == 0] = 0
     return rgb, alpha
+
+
+def ensure_rgb_artwork(rgb: np.ndarray) -> np.ndarray:
+    """Force clean 8-bit RGB (jpg／webp／已轉色檔都統一成 RGB 面層)."""
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("面層必須係 HxWx3 RGB")
+    return np.ascontiguousarray(rgb, dtype=np.uint8)
+
+
+def preserve_vivid_red(rgb: np.ndarray, strength: float = 0.45) -> np.ndarray:
+    """兩站式保紅：加強紅主導像素彩度，減少之後 RIP／預覽變暗偏褐。
+
+    strength 0=唔改；1=最強。只動紅區，其他色幾乎唔變。
+    """
+    s = float(np.clip(strength, 0.0, 1.0))
+    if s <= 1e-6:
+        return np.ascontiguousarray(rgb, dtype=np.uint8)
+    out = rgb.astype(np.float32)
+    r, g, b = out[:, :, 0], out[:, :, 1], out[:, :, 2]
+    redish = (r > 130.0) & (r > g + 20.0) & (r > b + 20.0)
+    if not np.any(redish):
+        return np.ascontiguousarray(rgb, dtype=np.uint8)
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    boost = 1.0 + 0.55 * s
+    r2 = np.clip(lum + (r - lum) * boost, 0, 255)
+    g2 = np.clip(lum + (g - lum) * boost, 0, 255)
+    b2 = np.clip(lum + (b - lum) * boost, 0, 255)
+    r2 = np.where(redish, np.clip(r2 + (255.0 - r2) * 0.10 * s, 0, 255), r)
+    g2 = np.where(redish, np.clip(g2 * (1.0 - 0.08 * s), 0, 255), g)
+    b2 = np.where(redish, np.clip(b2 * (1.0 - 0.06 * s), 0, 255), b)
+    out[:, :, 0] = np.where(redish, r2, r)
+    out[:, :, 1] = np.where(redish, g2, g)
+    out[:, :, 2] = np.where(redish, b2, b)
+    return np.ascontiguousarray(np.clip(np.rint(out), 0, 255).astype(np.uint8))
 
 
 def ink_coverage(alpha: np.ndarray) -> np.ndarray:
@@ -942,9 +983,15 @@ def process_artwork(
     preheat_bar: bool = False,
     registration_guides: bool = False,
     red_top_marks: bool = False,
+    two_station_preserve_red: bool = False,
+    preserve_red_strength: float = 0.45,
 ) -> ProcessResult:
     rgba, dpi = load_rgba(file_bytes, filename)
     rgb, alpha = flatten_rgb(rgba)
+    rgb = ensure_rgb_artwork(rgb)
+    if two_station_preserve_red:
+        # 兩站式：圖處理已出 RGB；呢站再保紅，之後用 RGB+Spot 出 TIFF
+        rgb = preserve_vivid_red(rgb, strength=float(preserve_red_strength))
     coverage, white = build_white_channel(
         alpha,
         choke_px,
@@ -1022,6 +1069,8 @@ def process_artwork(
         preheat_bar=bool(preheat_applied),
         registration_guides=bool(guides_applied),
         red_top_marks=bool(red_applied),
+        two_station_preserve_red=bool(two_station_preserve_red),
+        preserve_red_strength=float(preserve_red_strength) if two_station_preserve_red else 0.0,
     )
 
 
@@ -1609,6 +1658,203 @@ def render_channel_panel(
     )
 
 
+def snap_choke_px(value: float) -> float:
+    """白墨 choke 只取 0.5 格，範圍 0–10。唔影響 CMYK。"""
+    stepped = round(float(value) * 2.0) / 2.0
+    return float(min(10.0, max(0.0, stepped)))
+
+
+def default_saved_params() -> dict:
+    return {
+        "choke_px": float(DEFAULT_CHOKE_PX),
+        "white_x_offset_px": int(DEFAULT_WHITE_X_OFFSET_PX),
+        "bottom_white_fade": int(DEFAULT_BOTTOM_WHITE_FADE),
+        "crop_to_edges": bool(DEFAULT_CROP_TO_EDGES),
+        "lead_in_bar": bool(DEFAULT_LEAD_IN_BAR),
+        "preheat_bar": bool(DEFAULT_PREHEAT_BAR),
+        "registration_guides": bool(DEFAULT_REGISTRATION_GUIDES),
+        "red_top_marks": bool(DEFAULT_RED_TOP_MARKS),
+        "spot_invert_export": bool(DEFAULT_SPOT_INVERT_EXPORT),
+        "mirror_horizontal": bool(DEFAULT_MIRROR_HORIZONTAL),
+        "dpi_override": int(DEFAULT_DPI),
+        "two_station_preserve_red": True,
+        "preserve_red_strength": 0.45,
+    }
+
+
+def coerce_saved_params(raw: dict | None) -> dict:
+    base = default_saved_params()
+    if not isinstance(raw, dict):
+        return base
+    if "choke_px" in raw:
+        base["choke_px"] = snap_choke_px(raw["choke_px"])
+    if "white_x_offset_px" in raw:
+        base["white_x_offset_px"] = int(min(10, max(-10, round(float(raw["white_x_offset_px"])))))
+    if "bottom_white_fade" in raw:
+        base["bottom_white_fade"] = int(min(10, max(0, round(float(raw["bottom_white_fade"])))))
+    for key in (
+        "crop_to_edges",
+        "lead_in_bar",
+        "preheat_bar",
+        "registration_guides",
+        "red_top_marks",
+        "spot_invert_export",
+        "mirror_horizontal",
+        "two_station_preserve_red",
+    ):
+        if key in raw:
+            base[key] = bool(raw[key])
+    if "dpi_override" in raw:
+        base["dpi_override"] = int(min(600, max(72, round(float(raw["dpi_override"])))))
+    if "preserve_red_strength" in raw:
+        base["preserve_red_strength"] = float(min(1.0, max(0.0, float(raw["preserve_red_strength"]))))
+    return base
+
+
+def load_preset_file(path: Path = PRESETS_PATH) -> dict[str, dict]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for name, params in data.items():
+        label = str(name).strip()
+        if label and isinstance(params, dict):
+            out[label] = coerce_saved_params(params)
+    return out
+
+
+def write_preset_file(store: dict[str, dict], path: Path = PRESETS_PATH) -> None:
+    path.write_text(
+        json.dumps(store, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def upsert_preset(store: dict[str, dict], name: str, params: dict) -> dict[str, dict]:
+    label = name.strip()
+    if not label:
+        raise ValueError("請先打參數名稱")
+    store[label[:40]] = coerce_saved_params(params)
+    return store
+
+
+_TYPED_PARAM_KEYS = ("choke_px", "white_x_offset_px", "bottom_white_fade")
+
+
+def _init_saved_param_state() -> None:
+    for key, value in default_saved_params().items():
+        st.session_state.setdefault(key, value)
+    for key in _TYPED_PARAM_KEYS:
+        st.session_state.setdefault(f"{key}__typed", st.session_state[key])
+
+
+def _apply_pending_preset() -> None:
+    name = st.session_state.pop("pending_preset_load", None)
+    if not name:
+        return
+    params = load_preset_file().get(str(name))
+    if not params:
+        return
+    clean = coerce_saved_params(params)
+    for key, value in clean.items():
+        st.session_state[key] = value
+        if key in _TYPED_PARAM_KEYS:
+            st.session_state[f"{key}__typed"] = value
+
+
+def _sync_typed(src: str, dst: str) -> None:
+    st.session_state[dst] = st.session_state[src]
+
+
+def _on_choke_typed() -> None:
+    snapped = snap_choke_px(st.session_state["choke_px__typed"])
+    st.session_state["choke_px__typed"] = snapped
+    st.session_state["choke_px"] = snapped
+
+
+def _on_offset_typed() -> None:
+    value = int(min(10, max(-10, round(float(st.session_state["white_x_offset_px__typed"])))))
+    st.session_state["white_x_offset_px__typed"] = value
+    st.session_state["white_x_offset_px"] = value
+
+
+def _on_fade_typed() -> None:
+    value = int(min(10, max(0, round(float(st.session_state["bottom_white_fade__typed"])))))
+    st.session_state["bottom_white_fade__typed"] = value
+    st.session_state["bottom_white_fade"] = value
+
+
+def render_saved_params_column() -> None:
+    """可打字、可儲存的參數欄。只記白墨同標記，唔改 CMYK 面層。"""
+    st.markdown(
+        '<div class="panel-title">參數</div>'
+        '<div class="panel-copy">可直接打數字。儲存後下次可載入。只影響白墨同標記，CMYK 四色唔變。</div>',
+        unsafe_allow_html=True,
+    )
+    st.number_input(
+        "白墨內縮標桿 (Choke)",
+        min_value=0.0,
+        max_value=10.0,
+        step=0.5,
+        key="choke_px__typed",
+        on_change=_on_choke_typed,
+        help="打 0.5 的倍數。只收白墨通道。",
+    )
+    st.number_input(
+        "白墨水平偏移 (X)",
+        min_value=-10,
+        max_value=10,
+        step=1,
+        key="white_x_offset_px__typed",
+        on_change=_on_offset_typed,
+        help="負數往左，正數往右。只移白墨。",
+    )
+    st.number_input(
+        "下端起步白墨減弱",
+        min_value=0,
+        max_value=10,
+        step=1,
+        key="bottom_white_fade__typed",
+        on_change=_on_fade_typed,
+    )
+    st.text_input("參數名稱", key="preset_name_input", placeholder="例如 棉TEE")
+    if st.button("儲存參數", use_container_width=True):
+        label = str(st.session_state.get("preset_name_input", "")).strip()
+        if not label:
+            st.warning("請先打參數名稱。")
+        else:
+            store = load_preset_file()
+            upsert_preset(store, label, {k: st.session_state[k] for k in default_saved_params()})
+            write_preset_file(store)
+            st.session_state["preset_pick"] = label[:40]
+            st.success(f"已儲存「{label[:40]}」。")
+    store = load_preset_file()
+    names = sorted(store)
+    if names:
+        if "preset_pick" in st.session_state and st.session_state["preset_pick"] not in names:
+            st.session_state["preset_pick"] = names[0]
+        st.selectbox("已存參數", names, key="preset_pick")
+        load_col, del_col = st.columns(2)
+        with load_col:
+            if st.button("載入", use_container_width=True):
+                st.session_state["pending_preset_load"] = st.session_state["preset_pick"]
+                st.rerun()
+        with del_col:
+            if st.button("刪除", use_container_width=True):
+                picked = st.session_state.get("preset_pick")
+                if picked in store:
+                    del store[picked]
+                    write_preset_file(store)
+                    st.rerun()
+    else:
+        st.caption("未有已存參數。")
+
+
 def _inject_styles() -> None:
     st.markdown(
         """
@@ -1842,41 +2088,67 @@ def render_app() -> None:
         <div class="hero">
           <div class="hero-eyebrow">ON99</div>
           <h1>White Channel</h1>
-          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白；可水平微移、減弱下端白墨，亦可加底部廢墨條通墨。</p>
+          <p>有墨就打白（含黑墨）；退地／甩色透明位照原圖留空，不補白。再用 Choke 防露白。一站式：直接丟 jpg／png → 保紅 → 出 RGB+Spot TIFF。</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    left, right = st.columns(2, gap="large")
+    _init_saved_param_state()
+    _apply_pending_preset()
+
+    left, params_col, right = st.columns([1.15, 0.9, 1.15], gap="large")
 
     with left:
         st.markdown(
             '<div class="panel-title">輸入</div>'
-            '<div class="panel-copy">上傳退地透明 PNG。白墨跟 Alpha：甩色破洞不補白；黑字／黑線一樣有白底。</div>',
+            '<div class="panel-copy">一站式：直接上傳 jpg／png／webp（可實底）。退地圖用透明 PNG。白墨跟 Alpha：甩色破洞不補白；黑字／黑線一樣有白底。</div>',
             unsafe_allow_html=True,
         )
         source = st.file_uploader(
-            "製作白墨 TIFF",
-            type=["png", "webp"],
+            "製作白墨 TIFF（支援 jpg）",
+            type=["jpg", "jpeg", "png", "webp"],
             key="source_png",
-            help="背景須為透明退地。甩色破洞應係透明，唔好畫死黑底當甩色。",
+            help="直接丟 jpg 即可。退地圖用透明 PNG。預設一站式保紅 → RGB+Spot TIFF。",
             label_visibility="collapsed",
+        )
+
+        two_station_preserve_red = st.checkbox(
+            "一站式：jpg → RGB 保紅再出 TIFF（預設開）",
+            key="two_station_preserve_red",
+            help=(
+                "勾選（預設）：上傳 jpg／png 後自動統一 RGB、加強紅彩度，並強制匯出 PrintExp RGB+Spot TIFF（唔走 CMYK）。"
+                "退地透明 PNG 一樣可用。"
+            ),
+        )
+        preserve_red_strength = st.slider(
+            "保紅強度",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="preserve_red_strength",
+            disabled=not bool(st.session_state.get("two_station_preserve_red", False)),
+            help="0＝只轉 RGB+Spot 唔改色；建議 0.35–0.55。只影響紅主導區。",
         )
 
         choke_px = st.slider(
             "白墨內縮標桿 (Choke)",
             min_value=0.0,
             max_value=10.0,
-            value=float(DEFAULT_CHOKE_PX),
             step=0.5,
+            key="choke_px",
+            on_change=_sync_typed,
+            args=("choke_px", "choke_px__typed"),
             help="只收白墨通道，CMYK 面層四色唔變。每格 0.5。略縮白墨，避免白邊露出彩墨。甩色圖建議 2–3。",
         )
         white_x_offset_px = st.slider(
             "白墨水平偏移 (X)",
             min_value=-10,
             max_value=10,
-            value=DEFAULT_WHITE_X_OFFSET_PX,
+            step=1,
+            key="white_x_offset_px",
+            on_change=_sync_typed,
+            args=("white_x_offset_px", "white_x_offset_px__typed"),
             help=(
                 "印出來白墨偏左露鬼影時，調正數把白墨往右移對齊面層；"
                 "偏右則用負數。單位 px，上下唔使調。建議由 1–3 起微調。"
@@ -1887,7 +2159,10 @@ def render_app() -> None:
             "下端起步白墨減弱",
             min_value=0,
             max_value=10,
-            value=DEFAULT_BOTTOM_WHITE_FADE,
+            step=1,
+            key="bottom_white_fade",
+            on_change=_sync_typed,
+            args=("bottom_white_fade", "bottom_white_fade__typed"),
             help=(
                 "噴頭剛起步彩墨未穩、下端字／色棒透白時開。"
                 "只減弱全圖最下約 1/10 區白墨濃度（由帶頂正常 → 底邊漸弱）；"
@@ -1896,7 +2171,7 @@ def render_app() -> None:
         )
         crop_to_edges = st.checkbox(
             "啟用四邊裁切至圖案邊緣",
-            value=DEFAULT_CROP_TO_EDGES,
+            key="crop_to_edges",
             help=(
                 "自動裁走圖案四邊多餘透明底，畫布貼到不透明內容邊緣。"
                 "之後先加廢墨條／預熱條／定位線／紅標（唔會裁走呢啲標記）。預設關閉。"
@@ -1904,7 +2179,7 @@ def render_app() -> None:
         )
         lead_in_bar = st.checkbox(
             "啟用底部廢墨條 (Lead-in Bar)",
-            value=DEFAULT_LEAD_IN_BAR,
+            key="lead_in_bar",
             help=(
                 "喺圖案最底邊再下 1mm，置中加 Color Block（4cm×1cm C/M/Y/K，高度固定）＋100% 白底，"
                 "幫噴頭起步打通墨路。會自動加高畫布，預設關閉。"
@@ -1912,7 +2187,7 @@ def render_app() -> None:
         )
         preheat_bar = st.checkbox(
             "啟用預熱條（Color Block 頂）",
-            value=DEFAULT_PREHEAT_BAR,
+            key="preheat_bar",
             help=(
                 "喺 Color Block 頂再加 1/4 高單色預熱條（黑＋紅＋藍融合，唔係三段分色）。"
                 "唔食 Color Block 高度。要同時勾廢墨條先畫；唔勾就不畫。"
@@ -1920,7 +2195,7 @@ def render_app() -> None:
         )
         registration_guides = st.checkbox(
             "啟用定位線 [ ]",
-            value=DEFAULT_REGISTRATION_GUIDES,
+            key="registration_guides",
             help=(
                 "大圖案左右外側 1cm 畫 [ ]："
                 "豎段=圖下端四色（C/M/Y/K）長方形高；短橫 4mm；線寬 2px。"
@@ -1930,7 +2205,7 @@ def render_app() -> None:
         )
         red_top_marks = st.checkbox(
             "啟用紅標橫線（Color Block 頂）",
-            value=DEFAULT_RED_TOP_MARKS,
+            key="red_top_marks",
             help=(
                 "大圖案左右外側 1cm 各畫約 1cm 紅橫線（朝內；線寬 2px）。"
                 "高度對齊圖下端四色（C/M/Y/K）長方形頂，唔跟圖案頂。"
@@ -1939,12 +2214,12 @@ def render_app() -> None:
         )
         spot_invert_export = st.checkbox(
             "PrintEXP 白墨反相寫入（修外框全白／印相反）",
-            value=True,
+            key="spot_invert_export",
             help="預覽仍係「白=噴白」。寫入 TIFF 時反相 Spot，避免 PrintEXP 外四方噴白、印出嚟同預覽相反。",
         )
         mirror_horizontal = st.checkbox(
             "水平鏡像（修左右相反）",
-            value=False,
+            key="mirror_horizontal",
             help="DTG 直噴若衫左右相反就開。DTF 轉印視乎 PrintEXP 有冇自己鏡像。",
         )
         with st.expander("進階"):
@@ -1976,7 +2251,9 @@ def render_app() -> None:
                 value=False,
                 help="預設關閉。只需白墨時唔好開。",
             )
-            dpi_override = st.number_input("DPI", min_value=72, max_value=600, value=DEFAULT_DPI)
+            dpi_override = st.number_input(
+                "DPI", min_value=72, max_value=600, step=1, key="dpi_override"
+            )
             compression = st.radio(
                 "TIFF",
                 ["none", "zip"],
@@ -1988,6 +2265,13 @@ def render_app() -> None:
         generated_doc: ChannelDocument | None = None
         if source is not None:
             try:
+                # jpg／jpeg 一律走一站式保紅 + RGB+Spot（唔使再靠舊 session 勾選）
+                src_lower = (source.name or "").lower()
+                is_jpeg = src_lower.endswith((".jpg", ".jpeg"))
+                one_stop = bool(two_station_preserve_red) or is_jpeg
+                effective_export_mode = (
+                    "printexp_rgb_spot" if one_stop else export_mode
+                )
                 result = process_artwork(
                     file_bytes=source.getvalue(),
                     filename=source.name,
@@ -2003,6 +2287,12 @@ def render_app() -> None:
                     preheat_bar=bool(preheat_bar),
                     registration_guides=bool(registration_guides),
                     red_top_marks=bool(red_top_marks),
+                    two_station_preserve_red=bool(one_stop),
+                    preserve_red_strength=(
+                        float(preserve_red_strength)
+                        if one_stop
+                        else 0.0
+                    ),
                 )
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
@@ -2013,7 +2303,7 @@ def render_app() -> None:
                     compression=compression,
                     alpha=result.alpha,
                     include_w2=bool(include_w2),
-                    export_mode=export_mode,  # type: ignore[arg-type]
+                    export_mode=effective_export_mode,  # type: ignore[arg-type]
                     spot_invert_export=bool(result.spot_invert_export),
                 )
                 psd_bytes = write_psd_with_white(
@@ -2045,7 +2335,7 @@ def render_app() -> None:
                 meta = inspect_spot_metadata(tiff_bytes)
                 st.caption(
                     f"{meta.get('color_space','?').upper()} + Spot「{channel_name}」· "
-                    f"mode={export_mode} · spot={meta['is_photoshop_spot']} · "
+                    f"mode={effective_export_mode} · preserveRed={result.two_station_preserve_red}:{result.preserve_red_strength:.2f} · spot={meta['is_photoshop_spot']} · "
                     f"spp={meta['samples']} · invert={result.spot_invert_export} · "
                     f"mirror={result.mirror_horizontal} · "
                     f"x={result.white_x_offset_px:+d}px · "
@@ -2070,6 +2360,11 @@ def render_app() -> None:
                     st.warning(
                         "未偵測到 Color Block（圖下端四色 C/M/Y/K 長方形）。"
                         "勾「啟用底部廢墨條」或原圖下端要有四色條先畫紅標。"
+                    )
+                if one_stop:
+                    st.success(
+                        "一站式：jpg／png → RGB 保紅 → **RGB+Spot** TIFF（唔轉 CMYK）。"
+                        "PrintExp：Import → white = Spot。"
                     )
                 st.info(
                     "PrintExp：Import 呢個 .tif（檔名已去掉空格/括號）→ white Color → "
@@ -2096,6 +2391,9 @@ def render_app() -> None:
             key="inspect_file",
             label_visibility="collapsed",
         )
+
+    with params_col:
+        render_saved_params_column()
 
     inspect_doc: ChannelDocument | None = None
     if inspect_upload is not None:

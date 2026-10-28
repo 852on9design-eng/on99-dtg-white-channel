@@ -127,6 +127,27 @@ def test_choke_half_step_shrinks_white_only():
     assert int(b.white.sum()) < int(a.white.sum())
 
 
+def test_saved_params_roundtrip_keeps_cmyk_out():
+    from pathlib import Path
+    import tempfile
+
+    from app import coerce_saved_params, load_preset_file, snap_choke_px, upsert_preset, write_preset_file
+
+    assert snap_choke_px(2.3) == 2.5
+    assert snap_choke_px(2.5) == 2.5
+    assert snap_choke_px(-1) == 0.0
+    params = coerce_saved_params({"choke_px": 1.5, "white_x_offset_px": 4, "dpi_override": 300})
+    assert params["choke_px"] == 1.5
+    assert "cmyk" not in params
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "presets.json"
+        store = upsert_preset({}, "棉TEE", params)
+        write_preset_file(store, path)
+        loaded = load_preset_file(path)
+    assert loaded["棉TEE"]["choke_px"] == 1.5
+    assert loaded["棉TEE"]["white_x_offset_px"] == 4
+
+
 def test_offset_white_x_shifts_right_without_wrap():
     from app import offset_white_x
 
@@ -684,6 +705,7 @@ if __name__ == "__main__":
     test_safe_download_stem_strips_parens()
     test_spot_invert_and_mirror_helpers()
     test_choke_half_step_shrinks_white_only()
+    test_saved_params_roundtrip_keeps_cmyk_out()
     test_offset_white_x_shifts_right_without_wrap()
     test_soften_white_bottom_only_affects_lower_tenth()
     test_lead_in_bar_centered_expands_canvas()
