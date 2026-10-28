@@ -55,4 +55,4 @@ python3 test_tiff_export.py
 1. **站1 圖處理**：出 RGB png／jpg（保持螢幕原紅，唔轉 CMYK）。
 2. **站2 本 App**：需要先勾「一站式：jpg → RGB 保紅再出 TIFF」，調「保紅強度」，下載 TIFF。
    - 會統一 RGB 面層、加強紅區彩度，並**強制** `PrintExp RGB+Spot`（唔走 CMYK+Spot）。
-   - 退地透明 PNG 請用預設 CMYK+Spot；RGB+Spot 會把透明位 knockout 成白（唔印黑）。
+   - 退地透明 PNG 請用預設 CMYK+Spot；App 若偵測到透明位會**強制** CMYK+Spot（唔理一站式）。RGB+Spot 另外會把透明位 knockout 成白（唔印黑）；`flatten_rgb` 透明位改填白而非黑。

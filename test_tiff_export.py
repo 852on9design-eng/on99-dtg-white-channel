@@ -179,6 +179,49 @@ def test_saved_params_roundtrip_keeps_cmyk_out():
     assert loaded["棉TEE"]["white_x_offset_px"] == 4
 
 
+def test_flatten_rgb_transparent_is_white_not_black():
+    """Regression: rembg zeros must not stay RGB(0,0,0) for RGB+Spot PrintEXP."""
+    from app import flatten_rgb
+    import numpy as np
+
+    rgba = np.zeros((4, 4, 4), dtype=np.uint8)
+    rgba[1:3, 1:3] = (10, 20, 30, 255)
+    rgb, alpha = flatten_rgb(rgba)
+    assert rgb[0, 0].tolist() == [255, 255, 255]
+    assert alpha[0, 0] == 0
+    assert rgb[1, 1].tolist() == [10, 20, 30]
+    assert alpha[1, 1] == 255
+
+
+def test_cmyk_rembg_corner_matches_good_pattern():
+    """CMYK+Spot transparent corner = (0,0,0,0,255) with invert — same as known-good TIFF."""
+    from tifffile import TiffFile
+    import io
+    import numpy as np
+    from app import flatten_rgb, write_tiff_with_white
+
+    rgba = np.zeros((32, 32, 4), dtype=np.uint8)
+    rgba[8:24, 8:24] = (220, 40, 40, 255)
+    rgb, alpha = flatten_rgb(rgba)
+    white = alpha.copy()  # preview polarity: white where opaque
+    # Export with invert (PrintEXP default): transparent → spot 255
+    data = write_tiff_with_white(
+        rgb,
+        white,
+        300,
+        alpha=alpha,
+        export_mode="printexp_cmyk_spot",
+        spot_invert_export=True,
+    )
+    with TiffFile(io.BytesIO(data)) as tif:
+        arr = tif.pages[0].asarray()
+    assert arr.shape[2] == 5
+    assert arr[0, 0].tolist() == [0, 0, 0, 0, 255]
+    # Opaque red-ish has CMYK ink and low inverted spot (lots of white underbase)
+    assert arr[16, 16, :4].sum() > 0
+    assert int(arr[16, 16, 4]) < 128
+
+
 def test_default_one_stop_off():
     from app import default_saved_params
 

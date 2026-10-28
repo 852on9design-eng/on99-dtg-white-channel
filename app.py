@@ -229,9 +229,15 @@ def load_rgba(file_bytes: bytes, filename: str) -> tuple[np.ndarray, float]:
 
 
 def flatten_rgb(rgba: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Split RGBA. Transparent pixels → RGB white (not black).
+
+    Black zeros used to be fine for CMYK (ink×alpha→0), but RGB+Spot has no
+    alpha plane — PrintEXP treats (0,0,0) as solid black 退地. White fill is
+    ink-free in both CMYK and RGB+Spot even if alpha is later dropped.
+    """
     rgb = rgba[..., :3].copy()
     alpha = rgba[..., 3].copy()
-    rgb[alpha == 0] = 0
+    rgb[alpha == 0] = 255
     return rgb, alpha
 
 
@@ -2295,6 +2301,13 @@ def render_app() -> None:
                         else 0.0
                     ),
                 )
+                # 退地透明 PNG：強制 CMYK+Spot（同已知 OK 檔），避免 RGB+Spot 把
+                # flatten 黑底當成彩墨印出成片黑。一站式保紅只適用實底 jpg／海報。
+                has_rembg = bool(np.any(result.alpha == 0))
+                forced_cmyk_for_rembg = False
+                if has_rembg and effective_export_mode != "printexp_cmyk_spot":
+                    effective_export_mode = "printexp_cmyk_spot"
+                    forced_cmyk_for_rembg = True
                 generated_doc = document_from_process(result, channel_name)
                 tiff_bytes = write_tiff_with_white(
                     result.rgb,
@@ -2334,6 +2347,11 @@ def render_app() -> None:
                         use_container_width=True,
                     )
                 meta = inspect_spot_metadata(tiff_bytes)
+                if forced_cmyk_for_rembg:
+                    st.info(
+                        "偵測到退地透明：已強制 CMYK+Spot（唔走 RGB+Spot），"
+                        "避免透明位印成黑色。一站式保紅只適用實底 jpg。"
+                    )
                 st.caption(
                     f"{meta.get('color_space','?').upper()} + Spot「{channel_name}」· "
                     f"mode={effective_export_mode} · preserveRed={result.two_station_preserve_red}:{result.preserve_red_strength:.2f} · spot={meta['is_photoshop_spot']} · "
