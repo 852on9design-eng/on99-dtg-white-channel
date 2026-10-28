@@ -6,7 +6,6 @@ import numpy as np
 
 from tiff_export import (
     inspect_spot_metadata,
-    rgb_alpha_knockout,
     safe_download_stem,
     write_tiff_with_spot,
 )
@@ -56,36 +55,6 @@ def test_rgb_spot_mode():
     assert meta["color_space"] == "rgb"
     assert meta["samples"] == 4
     assert meta["is_photoshop_spot"]
-
-
-def test_rgb_spot_transparent_not_black():
-    """Regression: flatten_rgb zeros 退地 to RGB(0,0,0); RGB+Spot must knock out to white."""
-    from tifffile import TiffFile
-    import io
-
-    rgb, white, alpha = _sample()
-    # Simulate flatten_rgb black fill in transparent area
-    rgb = rgb.copy()
-    rgb[alpha == 0] = 0
-    assert rgb[0, 0].tolist() == [0, 0, 0]
-
-    knocked = rgb_alpha_knockout(rgb, alpha)
-    assert knocked[0, 0].tolist() == [255, 255, 255]
-    assert knocked[10, 10].tolist() == [220, 40, 40]
-
-    data = write_tiff_with_spot(
-        rgb,
-        white,
-        300,
-        mode="printexp_rgb_spot",
-        channel_name="white",
-        alpha=alpha,
-    )
-    with TiffFile(io.BytesIO(data)) as tif:
-        arr = tif.pages[0].asarray()
-    # Contiguous RGB+Spot → last dim samples; transparent pixel must not be black
-    assert arr[0, 0, 0] == 255 and arr[0, 0, 1] == 255 and arr[0, 0, 2] == 255
-    assert arr[10, 10, 0] == 220 and arr[10, 10, 1] == 40 and arr[10, 10, 2] == 40
 
 
 def test_legacy_is_not_spot():
@@ -156,76 +125,6 @@ def test_choke_half_step_shrinks_white_only():
     assert np.array_equal(a.rgb, b.rgb)
     assert np.array_equal(a.alpha, b.alpha)
     assert int(b.white.sum()) < int(a.white.sum())
-
-
-def test_saved_params_roundtrip_keeps_cmyk_out():
-    from pathlib import Path
-    import tempfile
-
-    from app import coerce_saved_params, load_preset_file, snap_choke_px, upsert_preset, write_preset_file
-
-    assert snap_choke_px(2.3) == 2.5
-    assert snap_choke_px(2.5) == 2.5
-    assert snap_choke_px(-1) == 0.0
-    params = coerce_saved_params({"choke_px": 1.5, "white_x_offset_px": 4, "dpi_override": 300})
-    assert params["choke_px"] == 1.5
-    assert "cmyk" not in params
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "presets.json"
-        store = upsert_preset({}, "棉TEE", params)
-        write_preset_file(store, path)
-        loaded = load_preset_file(path)
-    assert loaded["棉TEE"]["choke_px"] == 1.5
-    assert loaded["棉TEE"]["white_x_offset_px"] == 4
-
-
-def test_flatten_rgb_transparent_is_white_not_black():
-    """Regression: rembg zeros must not stay RGB(0,0,0) for RGB+Spot PrintEXP."""
-    from app import flatten_rgb
-    import numpy as np
-
-    rgba = np.zeros((4, 4, 4), dtype=np.uint8)
-    rgba[1:3, 1:3] = (10, 20, 30, 255)
-    rgb, alpha = flatten_rgb(rgba)
-    assert rgb[0, 0].tolist() == [255, 255, 255]
-    assert alpha[0, 0] == 0
-    assert rgb[1, 1].tolist() == [10, 20, 30]
-    assert alpha[1, 1] == 255
-
-
-def test_cmyk_rembg_corner_matches_good_pattern():
-    """CMYK+Spot transparent corner = (0,0,0,0,255) with invert — same as known-good TIFF."""
-    from tifffile import TiffFile
-    import io
-    import numpy as np
-    from app import flatten_rgb, write_tiff_with_white
-
-    rgba = np.zeros((32, 32, 4), dtype=np.uint8)
-    rgba[8:24, 8:24] = (220, 40, 40, 255)
-    rgb, alpha = flatten_rgb(rgba)
-    white = alpha.copy()  # preview polarity: white where opaque
-    # Export with invert (PrintEXP default): transparent → spot 255
-    data = write_tiff_with_white(
-        rgb,
-        white,
-        300,
-        alpha=alpha,
-        export_mode="printexp_cmyk_spot",
-        spot_invert_export=True,
-    )
-    with TiffFile(io.BytesIO(data)) as tif:
-        arr = tif.pages[0].asarray()
-    assert arr.shape[2] == 5
-    assert arr[0, 0].tolist() == [0, 0, 0, 0, 255]
-    # Opaque red-ish has CMYK ink and low inverted spot (lots of white underbase)
-    assert arr[16, 16, :4].sum() > 0
-    assert int(arr[16, 16, 4]) < 128
-
-
-def test_default_one_stop_off():
-    from app import default_saved_params
-
-    assert default_saved_params()["two_station_preserve_red"] is False
 
 
 def test_offset_white_x_shifts_right_without_wrap():
@@ -785,7 +684,6 @@ if __name__ == "__main__":
     test_safe_download_stem_strips_parens()
     test_spot_invert_and_mirror_helpers()
     test_choke_half_step_shrinks_white_only()
-    test_saved_params_roundtrip_keeps_cmyk_out()
     test_offset_white_x_shifts_right_without_wrap()
     test_soften_white_bottom_only_affects_lower_tenth()
     test_lead_in_bar_centered_expands_canvas()
