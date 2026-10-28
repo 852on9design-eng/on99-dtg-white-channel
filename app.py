@@ -1187,7 +1187,10 @@ def write_psd_with_white(
     alpha: np.ndarray | None = None,
 ) -> bytes:
     """RGB + named New Spot Channel PSD (PrintEXP-compatible channel layout)."""
-    del alpha
+    from tiff_export import rgb_alpha_knockout
+
+    if alpha is not None:
+        rgb = rgb_alpha_knockout(rgb, alpha)
     height, width = white.shape
     header = b"".join(
         [
@@ -1677,7 +1680,7 @@ def default_saved_params() -> dict:
         "spot_invert_export": bool(DEFAULT_SPOT_INVERT_EXPORT),
         "mirror_horizontal": bool(DEFAULT_MIRROR_HORIZONTAL),
         "dpi_override": int(DEFAULT_DPI),
-        "two_station_preserve_red": True,
+        "two_station_preserve_red": False,
         "preserve_red_strength": 0.45,
     }
 
@@ -2109,16 +2112,16 @@ def render_app() -> None:
             "製作白墨 TIFF（支援 jpg）",
             type=["jpg", "jpeg", "png", "webp"],
             key="source_png",
-            help="直接丟 jpg 即可。退地圖用透明 PNG。預設一站式保紅 → RGB+Spot TIFF。",
+            help="直接丟 jpg 即可。退地圖用透明 PNG。要保紅先勾下面「一站式」（不常用）。",
             label_visibility="collapsed",
         )
 
         two_station_preserve_red = st.checkbox(
-            "一站式：jpg → RGB 保紅再出 TIFF（預設開）",
+            "一站式：jpg → RGB 保紅再出 TIFF（不常用）",
             key="two_station_preserve_red",
             help=(
-                "勾選（預設）：上傳 jpg／png 後自動統一 RGB、加強紅彩度，並強制匯出 PrintExp RGB+Spot TIFF（唔走 CMYK）。"
-                "退地透明 PNG 一樣可用。"
+                "勾選先用：上傳 jpg／png 後自動統一 RGB、加強紅彩度，並強制匯出 PrintExp RGB+Spot TIFF（唔走 CMYK）。"
+                "平時唔使開；退地透明 PNG 請用預設 CMYK+Spot。"
             ),
         )
         preserve_red_strength = st.slider(
@@ -2265,10 +2268,8 @@ def render_app() -> None:
         generated_doc: ChannelDocument | None = None
         if source is not None:
             try:
-                # jpg／jpeg 一律走一站式保紅 + RGB+Spot（唔使再靠舊 session 勾選）
-                src_lower = (source.name or "").lower()
-                is_jpeg = src_lower.endswith((".jpg", ".jpeg"))
-                one_stop = bool(two_station_preserve_red) or is_jpeg
+                # 一站式只跟 checkbox（預設關；唔常用）。唔再自動對 jpg 強制開。
+                one_stop = bool(two_station_preserve_red)
                 effective_export_mode = (
                     "printexp_rgb_spot" if one_stop else export_mode
                 )

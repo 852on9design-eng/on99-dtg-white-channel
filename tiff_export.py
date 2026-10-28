@@ -51,6 +51,25 @@ def safe_download_stem(name: str) -> str:
     return stem or "artwork"
 
 
+def rgb_alpha_knockout(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """RGB(+alpha) face for RGB+Spot / legacy. Transparent → white (no color ink).
+
+    ``flatten_rgb`` in app.py does ``rgb[alpha == 0] = 0`` (black). That is safe
+    for CMYK because ``rgb_alpha_to_cmyk`` multiplies ink by alpha → 0. In an
+    RGB+Spot TIFF there is no alpha plane, so those zeros would print as solid
+    black 退地. Composite onto paper white so 退地 stays ink-free.
+    """
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("rgb 必須是 HxWx3")
+    if alpha.shape != rgb.shape[:2]:
+        raise ValueError("alpha 尺寸必須與 RGB 相同")
+    out = rgb.astype(np.float32)
+    a = (alpha.astype(np.float32) / 255.0)[..., None]
+    out = out * a + 255.0 * (1.0 - a)
+    out[alpha == 0] = 255.0
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
 def rgb_alpha_to_cmyk(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
     """RGB(+alpha) → CMYK ink. Fully transparent pixels stay ink-free."""
     if rgb.ndim != 3 or rgb.shape[2] != 3:
@@ -227,7 +246,8 @@ def write_tiff_with_spot(
         base = rgb_alpha_to_cmyk(rgb, alpha)
         photometric = "separated"
     else:
-        base = rgb
+        # Knock out 退地: do not leave flatten_rgb's black zeros in RGB TIFF.
+        base = rgb_alpha_knockout(rgb, alpha)
         photometric = "rgb"
 
     planes: list[np.ndarray] = [base, white[..., None]]
